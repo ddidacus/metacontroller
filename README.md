@@ -17,3 +17,14 @@ Implementation of the MetaController proposed in [Emergent temporal abstractions
     url     = {https://arxiv.org/abs/2512.20605}, 
 }
 ```
+
+```bibtex
+@article{Wagenmaker2025SteeringYD,
+    title   = {Steering Your Diffusion Policy with Latent Space Reinforcement Learning},
+    author  = {Andrew Wagenmaker and Mitsuhiko Nakamoto and Yunchu Zhang and Seohong Park and Waleed Yagoub and Anusha Nagabandi and Abhishek Gupta and Sergey Levine},
+    journal = {ArXiv},
+    year    = {2025},
+    volume  = {abs/2506.15799},
+    url     = {https://api.semanticscholar.org/CorpusID:279464702}
+}
+```
