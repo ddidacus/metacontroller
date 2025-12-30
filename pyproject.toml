@@ -1,5 +1,5 @@
 [project]
-name = "metacontroller"
+name = "metacontroller-pytorch"
 version = "0.0.1"
 description = "Transformer Metacontroller"
 authors = [
