@@ -1,5 +1,6 @@
 from __future__ import annotations
 from functools import partial
+from collections import namedtuple
 
 import torch
 from torch import nn, cat, stack, tensor
@@ -62,12 +63,12 @@ class MetaController(Module):
         self.bidirectional_temporal_compressor = GRU(dim_latent, dim_latent, bidirectional = True) # revisit naming
 
         self.emitter = GRU(dim_latent * 2, dim_latent * 2)
-        self.emitter_to_action_mean_log_var = LinearNoBias(dim_latent * 2, dim_latent * 2)
+        self.emitter_to_action_mean_log_var = Readout(dim_latent * 2, num_continuous = dim_latent)
 
         # internal rl phase substitutes the acausal + emitter with a causal ssm
 
         self.action_proposer = GRU(dim_latent, dim_latent)
-        self.action_proposer_mean_log_var = LinearNoBias(dim_latent, dim_latent * 2)
+        self.action_proposer_mean_log_var = Readout(dim_latent, num_continuous = dim_latent)
 
         # switching unit
 
@@ -123,24 +124,25 @@ class MetaController(Module):
             temporal_compressed = reduce(temporal_compressed, '... (two d) -> ... d', 'mean', two = 2)
 
             proposed_action_hidden, _ = self.emitter(cat((temporal_compressed, residual_stream), dim = -1))
-            proposed_action = self.emitter_to_action_mean_log_var(proposed_action_hidden)
+            readout = self.emitter_to_action_mean_log_var
 
         else: # else internal rl phase
             proposed_action_hidden, _ = self.action_proposer(residual_stream)
-            proposed_action = self.action_proposer_mean_log_var(proposed_action_hidden)
+            readout = self.action_proposer_mean_log_var
 
         # sample from the gaussian as the action from the meta controller
 
-        mean, log_var = proposed_action.chunk(2, dim = -1)
+        action_dist = readout(proposed_action_hidden)
 
-        std = (0.5 * log_var).exp()
-        sampled_action_intents = mean + torch.randn_like(mean) * std
+        sampled_action = readout.sample(action_dist)
 
         # need to encourage normal distribution
 
         vae_kl_loss = self.zero
 
         if discovery_phase:
+            mean, log_var = action_dist.unbind(dim = -1)
+
             vae_kl_loss = (0.5 * (
                 log_var.exp()
                 + mean.square()
@@ -150,13 +152,13 @@ class MetaController(Module):
 
         # switching unit timer
 
-        batch, _, dim = sampled_action_intents.shape
+        batch, _, dim = sampled_action.shape
 
         switching_unit_gru_out, switching_unit_gru_hidden = self.switching_unit(residual_stream)
 
         switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
 
-        action_intent_for_gating = rearrange(sampled_action_intents, 'b n d -> (b d) n')
+        action_intent_for_gating = rearrange(sampled_action, 'b n d -> (b d) n')
         switch_beta = repeat(switch_beta, 'b n d -> (b r d) n', r = dim if not self.switch_per_latent_dim else 1)
 
         forget = 1. - switch_beta
@@ -177,7 +179,7 @@ class MetaController(Module):
 
         modified_residual_stream = residual_stream + control_signal
 
-        return modified_residual_stream, vae_kl_loss
+        return modified_residual_stream, action_dist, sampled_action, vae_kl_loss
 
 # main transformer, which is subsumed into the environment after behavioral cloning
 
@@ -249,9 +251,9 @@ class Transformer(Module):
         # meta controller acts on residual stream here
 
         if exists(meta_controller):
-            modified_residual_stream, vae_aux_loss = meta_controller(residual_stream, discovery_phase = discovery_phase)
+            modified_residual_stream, action_dist, sampled_action, vae_aux_loss = meta_controller(residual_stream, discovery_phase = discovery_phase)
         else:
-            modified_residual_stream, vae_aux_loss = residual_stream, self.zero
+            modified_residual_stream, action_dist, sampled_action, vae_aux_loss = residual_stream, None, None, self.zero
 
         # modified residual stream sent back
 
