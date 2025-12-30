@@ -215,6 +215,8 @@ class Transformer(Module):
 
         self.meta_controller = meta_controller
 
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
     def evolve(
         self,
         environment,
@@ -238,7 +240,7 @@ class Transformer(Module):
         discovery_phase = False,
         return_latents = False
     ):
-        meta_controller = default(meta_controller, self.meta_controller, Identity())
+        meta_controller = default(meta_controller, self.meta_controller)
 
         embed = self.embed(ids)
 
@@ -246,7 +248,10 @@ class Transformer(Module):
 
         # meta controller acts on residual stream here
 
-        modified_residual_stream, vae_aux_loss = meta_controller(residual_stream, discovery_phase = discovery_phase)
+        if exists(meta_controller):
+            modified_residual_stream, vae_aux_loss = meta_controller(residual_stream, discovery_phase = discovery_phase)
+        else:
+            modified_residual_stream, vae_aux_loss = residual_stream, self.zero
 
         # modified residual stream sent back
 
