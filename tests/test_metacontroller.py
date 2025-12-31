@@ -44,8 +44,8 @@ def test_metacontroller(
 
     # discovery phase
 
-    (action_recon_loss, kl_loss) = model(state, actions, meta_controller = meta_controller, discovery_phase = True)
-    (action_recon_loss + kl_loss * 0.1).backward()
+    (action_recon_loss, kl_loss, switch_loss) = model(state, actions, meta_controller = meta_controller, discovery_phase = True)
+    (action_recon_loss + kl_loss * 0.1 + switch_loss * 0.2).backward()
 
     # internal rl
 

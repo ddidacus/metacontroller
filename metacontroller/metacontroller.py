@@ -57,7 +57,8 @@ MetaControllerOutput = namedtuple('MetaControllerOutput', (
     'prev_hiddens',
     'action_dist',
     'actions',
-    'kl_loss'
+    'kl_loss',
+    'switch_loss'
 ))
 
 class MetaController(Module):
@@ -173,7 +174,7 @@ class MetaController(Module):
 
         # need to encourage normal distribution
 
-        kl_loss = self.zero
+        kl_loss = switch_loss = self.zero
 
         if discovery_phase:
             mean, log_var = action_dist.unbind(dim = -1)
@@ -187,6 +188,10 @@ class MetaController(Module):
 
             kl_loss = kl_loss * switch_beta
             kl_loss = kl_loss.sum(dim = -1).mean()
+
+            # encourage less switching
+
+            switch_loss = switch_beta.mean()
 
         # maybe hard switch, then use associative scan
 
@@ -220,7 +225,7 @@ class MetaController(Module):
             next_switch_gated_action
         )
 
-        return modified_residual_stream, MetaControllerOutput(next_hiddens, action_dist, sampled_action, kl_loss)
+        return modified_residual_stream, MetaControllerOutput(next_hiddens, action_dist, sampled_action, kl_loss, switch_loss)
 
 # main transformer, which is subsumed into the environment after behavioral cloning
 
@@ -357,7 +362,7 @@ class Transformer(Module):
 
             action_recon_loss = self.action_readout.calculate_loss(dist_params, target_action_ids)
 
-            return action_recon_loss, next_meta_hiddens.kl_loss
+            return action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.switch_loss
 
         # returning
 
