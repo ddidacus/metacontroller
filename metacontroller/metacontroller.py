@@ -308,7 +308,8 @@ class Transformer(Module):
 
         # handle maybe behavioral cloning
 
-        if behavioral_cloning:
+        if behavioral_cloning or (meta_controlling and discovery_phase):
+
             state, target_state = state[:, :-1], state[:, 1:]
             action_ids, target_action_ids = action_ids[:, :-1], action_ids[:, 1:]
 
@@ -351,6 +352,12 @@ class Transformer(Module):
             action_clone_loss = self.action_readout.calculate_loss(dist_params, target_action_ids)
 
             return state_clone_loss, action_clone_loss
+
+        elif meta_controlling and discovery_phase:
+
+            action_recon_loss = self.action_readout.calculate_loss(dist_params, target_action_ids)
+
+            return action_recon_loss, next_meta_hiddens.kl_loss
 
         # returning
 
