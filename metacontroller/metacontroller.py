@@ -18,7 +18,7 @@ from einops.layers.torch import Rearrange
 
 # external modules
 
-from x_transformers import Decoder
+from x_transformers import Encoder, Decoder
 from x_mlps_pytorch import Feedforwards
 from x_evolution import EvoStrategy
 
@@ -72,7 +72,11 @@ class MetaController(Module):
         decoder_expansion_factor = 2.,
         decoder_depth = 1,
         hypernetwork_low_rank = 16,
-        assoc_scan_kwargs: dict = dict()
+        assoc_scan_kwargs: dict = dict(),
+        bidirectional_temporal_encoder_kwargs: dict = dict(
+            attn_dim_head = 32,
+            heads = 8
+        )
     ):
         super().__init__()
         dim_meta = default(dim_meta_controller, dim_model)
@@ -81,9 +85,9 @@ class MetaController(Module):
 
         self.model_to_meta = Linear(dim_model, dim_meta)
 
-        # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use a bidirectional GRU as placeholders
+        # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use bidirectional attention as placeholder
 
-        self.bidirectional_temporal_compressor = GRU(dim_meta, dim_meta, bidirectional = True) # revisit naming
+        self.bidirectional_temporal_encoder = Encoder(dim = dim_meta, depth = 1, **bidirectional_temporal_encoder_kwargs)
 
         self.emitter = GRU(dim_meta * 2, dim_meta * 2)
         self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
@@ -122,7 +126,7 @@ class MetaController(Module):
     def discovery_parameters(self):
         return [
             *self.model_to_meta.parameters(),
-            *self.bidirectional_temporal_compressor.parameters(),
+            *self.bidirectional_temporal_encoder.parameters(),
             *self.emitter.parameters(),
             *self.emitter_to_action_mean_log_var.parameters(),
             *self.decoder.parameters(),
@@ -157,10 +161,9 @@ class MetaController(Module):
         if discovery_phase:
             logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
 
-            temporal_compressed, _ = self.bidirectional_temporal_compressor(meta_embed)
-            temporal_compressed = reduce(temporal_compressed, '... (two d) -> ... d', 'mean', two = 2)
+            encoded_temporal = self.bidirectional_temporal_encoder(meta_embed)
 
-            proposed_action_hidden, _ = self.emitter(cat((temporal_compressed, meta_embed), dim = -1))
+            proposed_action_hidden, _ = self.emitter(cat((encoded_temporal, meta_embed), dim = -1))
             readout = self.emitter_to_action_mean_log_var
 
         else: # else internal rl phase
