@@ -4,6 +4,16 @@
 
 Implementation of the MetaController proposed in [Emergent temporal abstractions in autoregressive models enable hierarchical reinforcement learning](https://arxiv.org/abs/2512.20605)
 
+## Install
+
+```shell
+$ pip install metacontroller-pytorch
+```
+
+## Appreciation
+
+- [Pranoy](https://github.com/pranoyr) for submitting a pull request for fixing the previous latent action not being included in the inputs to the switching unit
+
 ## Citations
 
 ```bibtex

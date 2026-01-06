@@ -4,6 +4,8 @@ param = pytest.mark.parametrize
 import torch
 from metacontroller.metacontroller import Transformer, MetaController
 
+from einops import rearrange
+
 @param('action_discrete', (False, True))
 @param('switch_per_latent_dim', (False, True))
 def test_metacontroller(
@@ -49,16 +51,18 @@ def test_metacontroller(
     (action_recon_loss, kl_loss, switch_loss) = model(state, actions, meta_controller = meta_controller, discovery_phase = True)
     (action_recon_loss + kl_loss * 0.1 + switch_loss * 0.2).backward()
 
-    # internal rl
+    # internal rl - done iteratively
 
-    logits, cache = model(state, actions, meta_controller = meta_controller, return_cache = True)
+    cache = None
+    past_action_id = None
 
-    assert logits.shape == (1, 1024, *assert_shape)
+    for one_state in state.unbind(dim = 1):
+        one_state = rearrange(one_state, 'b d -> b 1 d')
 
-    logits, cache = model(state, actions, meta_controller = meta_controller, return_cache = True, cache = cache)
-    logits, cache = model(state, actions, meta_controller = meta_controller, return_cache = True, cache = cache)
+        logits, cache = model(one_state, past_action_id, meta_controller = meta_controller, return_cache = True)
 
-    assert logits.shape == (1, 1, *assert_shape)
+        assert logits.shape == (1, 1, *assert_shape)
+        past_action_id = model.action_readout.sample(logits)
 
     # evolutionary strategies over grpo
 

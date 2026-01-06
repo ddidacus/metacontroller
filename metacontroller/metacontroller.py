@@ -46,6 +46,17 @@ def default(*args):
             return arg
     return None
 
+def is_empty(t):
+    return t.numel() == 0
+
+def pad_at_dim(t, pad: tuple[int, int], dim = -1, value = 0.):
+    if pad == (0, 0):
+        return t
+
+    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
+    zeros = ((0, 0) * dims_from_right)
+    return F.pad(t, (*zeros, *pad), value = value)
+
 # tensor helpers
 
 def straight_through(src, tgt):
@@ -149,10 +160,11 @@ class MetaController(Module):
         hard_switch = False,
         temperature = 1.
     ):
+        device = residual_stream.device
 
         # destruct prev cache
 
-        prev_action_proposer_hidden, prev_switching_unit_gru_hidden, prev_switch_gated_hiddens = cache.prev_hiddens if exists(cache) else ((None,) * 3)
+        prev_action_proposer_hidden, prev_switching_unit_gru_hidden, prev_switch_gated_hiddens, prev_sampled_latent_action = cache.prev_hiddens if exists(cache) else ((None,) * 4)
 
         # getting proposed action for the two phases
 
@@ -177,30 +189,27 @@ class MetaController(Module):
 
         action_dist = readout(proposed_action_hidden)
 
-        sampled_action = readout.sample(action_dist, temperature = temperature)
+        sampled_latent_action = readout.sample(action_dist, temperature = temperature)
 
         # switching unit timer
 
-        batch, _, dim = sampled_action.shape
+        batch, seq_len, dim = sampled_latent_action.shape
 
-        batch, seq_len, _ = meta_embed.shape
+        # initialize prev sampled latent action to be zeros if not available (for first timestep and for discovery phase)
+
+        if not exists(prev_sampled_latent_action):
+            prev_sampled_latent_action = torch.zeros(batch, 1, self.dim_latent, device = device)
+
         if discovery_phase:
-            # shift the proposed actions to the right to simulate "previous"
-            z_prev = torch.cat([
-                torch.zeros_like(sampled_action[:, :1]), 
-                sampled_action[:, :-1]
-            ], dim=1)
+            z_prev = cat((prev_sampled_latent_action, sampled_latent_action[:, :-1]), dim = 1)
+
         else:
-            # In inference, we fetch the actual previous z from the cache
-            if exists(prev_switch_gated_hiddens):
-                z_prev = prev_switch_gated_hiddens
-                # Ensure z_prev has sequence dimension (Batch, 1, Dim)
-                if z_prev.ndim == 2:
-                    z_prev = z_prev.unsqueeze(1)
-            else:
-                # initialize with zeros 
-                batch, _, _ = meta_embed.shape
-                z_prev = torch.zeros(batch, seq_len, self.dim_latent, device=meta_embed.device)
+            # else during inference, use the previous sampled latent action
+
+            assert seq_len == 1, f'inference RL phase must be done one token at a time'
+            z_prev = prev_sampled_latent_action
+
+        # switch input is previous latent action and the embedding
 
         switch_input = torch.cat((meta_embed, z_prev), dim=-1)
 
@@ -239,7 +248,7 @@ class MetaController(Module):
             switch_beta = straight_through(switch_beta, hard_switch_beta)
 
         forget = 1. - switch_beta
-        gated_action = self.switch_gating(switch_beta, sampled_action * forget, prev = prev_switch_gated_hiddens)
+        gated_action = self.switch_gating(switch_beta, sampled_latent_action * forget, prev = prev_switch_gated_hiddens)
 
         next_switch_gated_action = gated_action[:, -1]
 
@@ -259,10 +268,11 @@ class MetaController(Module):
         next_hiddens = (
             next_action_proposer_hidden,
             next_switching_unit_gru_hidden,
-            next_switch_gated_action
+            next_switch_gated_action,
+            sampled_latent_action[:, -1:]
         )
 
-        return control_signal, MetaControllerOutput(next_hiddens, action_dist, sampled_action, kl_loss, switch_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, action_dist, sampled_latent_action, kl_loss, switch_loss)
 
 # main transformer, which is subsumed into the environment after behavioral cloning
 
@@ -323,7 +333,7 @@ class Transformer(Module):
     def forward(
         self,
         state,
-        action_ids,
+        action_ids: Tensor | None = None,
         meta_controller: Module | None = None,
         cache: TransformerOutput | None = None,
         discovery_phase = False,
@@ -332,6 +342,8 @@ class Transformer(Module):
         return_latents = False,
         return_cache = False,
     ):
+        device = state.device
+
         meta_controller = default(meta_controller, self.meta_controller)
 
         meta_controlling = exists(meta_controller)
@@ -351,6 +363,7 @@ class Transformer(Module):
         # handle maybe behavioral cloning
 
         if behavioral_cloning or (meta_controlling and discovery_phase):
+            assert not is_empty(action_ids), f'`action_ids` cannot be empty when doing discovery or behavioral cloning'
 
             state, target_state = state[:, :-1], state[:, 1:]
             action_ids, target_action_ids = action_ids[:, :-1], action_ids[:, 1:]
@@ -360,7 +373,16 @@ class Transformer(Module):
         with lower_transformer_context():
 
             state_embed = self.state_embed(state)
-            action_embed = self.action_embed(action_ids)
+
+            # handle no past action for first timestep
+
+            if exists(action_ids):
+                action_embed = self.action_embed(action_ids)
+            else:
+                action_embed = state_embed[:, 0:0] # empty action embed
+
+            if action_embed.shape[-2] == (state_embed.shape[-2] - 1):
+                action_embed = pad_at_dim(action_embed, (1, 0), dim = 1)
 
             embed = state_embed + action_embed
 
