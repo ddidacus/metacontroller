@@ -46,9 +46,6 @@ def default(*args):
             return arg
     return None
 
-def is_empty(t):
-    return t.numel() == 0
-
 def pad_at_dim(t, pad: tuple[int, int], dim = -1, value = 0.):
     if pad == (0, 0):
         return t
@@ -333,7 +330,7 @@ class Transformer(Module):
     def forward(
         self,
         state,
-        action_ids: Tensor | None = None,
+        actions: Tensor | None = None,
         meta_controller: Module | None = None,
         cache: TransformerOutput | None = None,
         discovery_phase = False,
@@ -363,10 +360,10 @@ class Transformer(Module):
         # handle maybe behavioral cloning
 
         if behavioral_cloning or (meta_controlling and discovery_phase):
-            assert not is_empty(action_ids), f'`action_ids` cannot be empty when doing discovery or behavioral cloning'
+            assert exists(actions), f'`actions` cannot be empty when doing discovery or behavioral cloning'
 
             state, target_state = state[:, :-1], state[:, 1:]
-            action_ids, target_action_ids = action_ids[:, :-1], action_ids[:, 1:]
+            actions, target_actions = actions[:, :-1], actions[:, 1:]
 
         # transformer lower body
 
@@ -376,8 +373,8 @@ class Transformer(Module):
 
             # handle no past action for first timestep
 
-            if exists(action_ids):
-                action_embed = self.action_embed(action_ids)
+            if exists(actions):
+                action_embed = self.action_embed(actions)
             else:
                 action_embed = state_embed[:, 0:0] # empty action embed
 
@@ -415,13 +412,13 @@ class Transformer(Module):
             state_dist_params = self.state_readout(attended)
             state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state)
 
-            action_clone_loss = self.action_readout.calculate_loss(dist_params, target_action_ids)
+            action_clone_loss = self.action_readout.calculate_loss(dist_params, target_actions)
 
             return state_clone_loss, action_clone_loss
 
         elif meta_controlling and discovery_phase:
 
-            action_recon_loss = self.action_readout.calculate_loss(dist_params, target_action_ids)
+            action_recon_loss = self.action_readout.calculate_loss(dist_params, target_actions)
 
             return action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.switch_loss
 
