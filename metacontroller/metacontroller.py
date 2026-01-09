@@ -26,6 +26,8 @@ from discrete_continuous_embed_readout import Embed, Readout, EmbedAndReadout
 
 from assoc_scan import AssocScan
 
+from torch_einops_utils import pad_at_dim
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
@@ -45,14 +47,6 @@ def default(*args):
         if exists(arg):
             return arg
     return None
-
-def pad_at_dim(t, pad: tuple[int, int], dim = -1, value = 0.):
-    if pad == (0, 0):
-        return t
-
-    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
-    zeros = ((0, 0) * dims_from_right)
-    return F.pad(t, (*zeros, *pad), value = value)
 
 # tensor helpers
 
