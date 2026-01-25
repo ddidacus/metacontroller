@@ -101,9 +101,12 @@ if __name__ == "__main__":
     discovery_phase = False
     total_epochs = args.cloning_epochs + args.discovery_epochs
     progressbar = tqdm(range(len(dataset) * total_epochs))
+    model.train()
+    visual_encoder.train()
     for epoch in range(total_epochs):
         if epoch >= args.cloning_epochs:
             discovery_phase = True
+            
         for batch in dataset:
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -118,6 +121,13 @@ if __name__ == "__main__":
             behavior_cloning_loss = state_clone_loss + 0.5 * action_clone_loss
             optimizer.zero_grad()
             behavior_cloning_loss.backward()
+            
+            # Compute gradient norm before clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                list(visual_encoder.parameters()) + list(model.parameters()),
+                max_norm=1.0
+            )
+            
             optimizer.step()
             progressbar.update(1)
             progressbar.set_description(f"loss={behavior_cloning_loss.item():.4f}")
@@ -128,6 +138,7 @@ if __name__ == "__main__":
                     "loss": behavior_cloning_loss.item(),
                     "state_clone_loss": state_clone_loss.item(),
                     "action_clone_loss": action_clone_loss.item(),
+                    "grad_norm": grad_norm.item(),
                     "epoch": epoch
                 })
 
