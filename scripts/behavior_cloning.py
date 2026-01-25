@@ -1,3 +1,4 @@
+import os
 import h5py
 import torch
 import argparse
@@ -50,6 +51,24 @@ class BehaviorCloningDataset(Dataset):
         if self._h5file is not None:
             self._h5file.close()
 
+def save_checkpoint(epoch, global_step, discovery_phase):
+    """Save training checkpoint."""
+    if args.checkpoint_dir is None:
+        return
+    checkpoint = {
+        "model": model.state_dict(),
+        "visual_encoder": visual_encoder.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "discovery_phase": discovery_phase,
+    }
+    ckpt_path = os.path.join(args.checkpoint_dir, f"checkpoint_step_{global_step}.pt")
+    torch.save(checkpoint, ckpt_path)
+    # Also save as latest for easy resume
+    latest_path = os.path.join(args.checkpoint_dir, "checkpoint_latest.pt")
+    torch.save(checkpoint, latest_path)
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -81,6 +100,12 @@ if __name__ == "__main__":
                         help="learning rate for Adam optimizer")
     parser.add_argument("--device", type=str, default="cuda",
                         help="device to use for training")
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                        help="directory to save checkpoints")
+    parser.add_argument("--checkpoint_every", type=int, default=50,
+                        help="save checkpoint every k steps")
+    parser.add_argument("--resume_checkpoint", type=str, default=None,
+                        help="path to checkpoint to resume from")
     args = parser.parse_args()
 
     # Set device
@@ -121,17 +146,42 @@ if __name__ == "__main__":
         {'params': model.parameters(), 'lr': args.model_lr}
     ])
 
+    # Create checkpoint directory if specified
+    if args.checkpoint_dir is not None:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    start_step = 0
+    global_step = 0
+    if args.resume_checkpoint is not None:
+        print(f"Resuming from checkpoint: {args.resume_checkpoint}")
+        checkpoint = torch.load(args.resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        visual_encoder.load_state_dict(checkpoint["visual_encoder"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = checkpoint["epoch"]
+        global_step = checkpoint["global_step"]
+        start_step = global_step % len(dataset)  # step within current epoch
+        print(f"Resumed at epoch {start_epoch}, global step {global_step}")
+
     # Behavioral cloning
     discovery_phase = False
     total_epochs = args.cloning_epochs + args.discovery_epochs
-    progressbar = tqdm(range(len(dataset) * total_epochs))
+    total_steps = len(dataset) * total_epochs
+    progressbar = tqdm(range(total_steps), initial=global_step)
     model.train()
     visual_encoder.train()
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         if epoch >= args.cloning_epochs:
             discovery_phase = True
 
-        for batch in dataset:
+        for step_in_epoch, batch in enumerate(dataset):
+            # Skip steps if resuming mid-epoch
+            if epoch == start_epoch and step_in_epoch < start_step:
+                continue
+            
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
             
@@ -153,6 +203,7 @@ if __name__ == "__main__":
             )
             
             optimizer.step()
+            global_step += 1
             progressbar.update(1)
             progressbar.set_description(f"loss={behavior_cloning_loss.item():.4f}")
             
@@ -163,8 +214,18 @@ if __name__ == "__main__":
                     "state_clone_loss": state_clone_loss.item(),
                     "action_clone_loss": action_clone_loss.item(),
                     "grad_norm": grad_norm.item(),
-                    "epoch": epoch
+                    "epoch": epoch,
+                    "global_step": global_step
                 })
+            
+            # Save checkpoint every k steps
+            if args.checkpoint_dir is not None and global_step % args.checkpoint_every == 0:
+                save_checkpoint(epoch, global_step, discovery_phase)
+
+    # Save final checkpoint
+    if args.checkpoint_dir is not None:
+        save_checkpoint(total_epochs, global_step, discovery_phase)
+        print(f"Final checkpoint saved at step {global_step}")
 
     # Store model
     torch.save({
