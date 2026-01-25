@@ -1,3 +1,4 @@
+import h5py
 import torch
 import argparse
 from metacontroller import (
@@ -9,22 +10,45 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 
 class BehaviorCloningDataset(Dataset):
-    def __init__(self, file_path:str):
-        dataset = torch.load(file_path)
-        self.observations = dataset["episode_obs"].permute(0, 1, 4, 2, 3).float() # B, T, C, H, W
-        self.actions = dataset["episode_act"].squeeze(-1).int()  # B, T
-        self.masks = dataset["episode_masks"].bool()
-        assert self.observations.shape[0] == self.actions.shape[0]
-
+    """
+    Lazy-loading dataset for HDF5 trajectory files.
+    Only loads individual samples on-demand to avoid OOM.
+    
+    Note: For multi-worker DataLoader, each worker opens its own file handle.
+    """
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self._h5file = None
+        
+        # Get dataset length without loading data into memory
+        with h5py.File(file_path, "r") as f:
+            self._len = f["episode_obs"].shape[0]
+    
+    @property
+    def h5file(self):
+        """Lazy open - handles multi-worker DataLoader by opening per-worker."""
+        if self._h5file is None:
+            self._h5file = h5py.File(self.file_path, "r")
+        return self._h5file
+    
     def __len__(self):
-        return len(self.observations)
+        return self._len
 
     def __getitem__(self, idx):
+        # Load single sample from disk
+        obs = torch.from_numpy(self.h5file["episode_obs"][idx]).permute(0, 3, 1, 2).float()  # T, C, H, W
+        actions = torch.from_numpy(self.h5file["episode_act"][idx]).squeeze(-1).int()  # T
+        masks = torch.from_numpy(self.h5file["episode_masks"][idx]).bool()  # T
+        
         return {
-            'state': self.observations[idx], 
-            'actions': self.actions[idx],
-            'masks': self.masks[idx]
+            'state': obs,
+            'actions': actions,
+            'masks': masks
         }
+    
+    def __del__(self):
+        if self._h5file is not None:
+            self._h5file.close()
 
 if __name__ == "__main__":
 
@@ -76,7 +100,7 @@ if __name__ == "__main__":
         BehaviorCloningDataset(args.dataset_path), 
         batch_size=args.batch_size,
         shuffle=True, 
-        num_workers=4
+        num_workers=16
     )
 
     # Model
@@ -106,7 +130,7 @@ if __name__ == "__main__":
     for epoch in range(total_epochs):
         if epoch >= args.cloning_epochs:
             discovery_phase = True
-            
+
         for batch in dataset:
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
