@@ -108,12 +108,12 @@ class MetaController(Module):
         self.switching_unit = GRU(dim_meta + dim_latent, dim_meta)
         self.to_switching_unit_beta = nn.Linear(dim_meta, dim_latent if switch_per_latent_dim else 1, bias = False)
 
+        # Associative scan: apply scan operator to a sequence and an associative binary operator to the growing set
+        # Associative scan: apply scan operator to a sequence and an associative binary operator to the growing set
         self.switch_gating = AssocScan(**assoc_scan_kwargs)
 
         # decoder
-
         assert hypernetwork_low_rank < dim_latent
-
         dim_decoder_hidden = int(dim_latent * decoder_expansion_factor)
 
         self.decoder = Feedforwards(
@@ -124,7 +124,6 @@ class MetaController(Module):
         )
 
         self.to_hyper_network_weights = Rearrange('... (two d r) -> two ... d r', two = 2, r = hypernetwork_low_rank)
-
         self.register_buffer('zero', tensor(0.), persistent = False)
 
     def discovery_parameters(self):
@@ -196,14 +195,11 @@ class MetaController(Module):
 
         else:
             # else during inference, use the previous sampled latent action
-
             assert seq_len == 1, f'inference RL phase must be done one token at a time'
             z_prev = prev_sampled_latent_action
 
-        # switch input is previous latent action and the embedding
-
+        # Switching unit takes (activation, z_prev) -> gru -> switching signal
         switch_input = torch.cat((meta_embed, z_prev), dim=-1)
-
         switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
             switch_input, 
             prev_switching_unit_gru_hidden
@@ -211,20 +207,17 @@ class MetaController(Module):
 
         switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
 
-        # need to encourage normal distribution
-
+        # KL shaping the policy dist 
         kl_loss = switch_loss = self.zero
 
         if discovery_phase:
             mean, log_var = action_dist.unbind(dim = -1)
-
             kl_loss = (0.5 * (
                 log_var.exp()
                 + mean.square()
                 - log_var
                 - 1.
             ))
-
             kl_loss = kl_loss * switch_beta
             kl_loss = kl_loss.sum(dim = -1).mean()
 
@@ -262,7 +255,6 @@ class MetaController(Module):
             next_switch_gated_action,
             sampled_latent_action[:, -1:]
         )
-
         return control_signal, MetaControllerOutput(next_hiddens, action_dist, sampled_latent_action, kl_loss, switch_loss)
 
 # main transformer, which is subsumed into the environment after behavioral cloning
@@ -325,6 +317,7 @@ class Transformer(Module):
         self,
         state,
         actions: Tensor | None = None,
+        mask: Tensor | None = None,
         meta_controller: Module | None = None,
         cache: TransformerOutput | None = None,
         discovery_phase = False,
@@ -334,93 +327,74 @@ class Transformer(Module):
         return_cache = False,
     ):
         device = state.device
-
         meta_controller = default(meta_controller, self.meta_controller)
-
         meta_controlling = exists(meta_controller)
-
         behavioral_cloning = not meta_controlling and not return_raw_action_dist
 
         # by default, if meta controller is passed in, transformer is no grad
-
         lower_transformer_context = nullcontext if not meta_controlling else torch.no_grad
         meta_controller_context = nullcontext if meta_controlling else torch.no_grad
         upper_transformer_context = nullcontext if (not meta_controlling or discovery_phase) else torch.no_grad
 
         # handle cache
-
         lower_transformer_hiddens, meta_hiddens, upper_transformer_hiddens = cache.prev_hiddens if exists(cache) else ((None,) * 3)
 
-        # handle maybe behavioral cloning
-
+        # behavioral cloning / discovery phase -> access target sequences
         if behavioral_cloning or (meta_controlling and discovery_phase):
             assert exists(actions), f'`actions` cannot be empty when doing discovery or behavioral cloning'
-
             state, target_state = state[:, :-1], state[:, 1:]
             actions, target_actions = actions[:, :-1], actions[:, 1:]
+            # shift mask to align with input/target split
+            if exists(mask):
+                mask, target_mask = mask[:, :-1], mask[:, 1:]
+            else:
+                target_mask = None
 
         # transformer lower body
-
         with lower_transformer_context():
-
             state_embed = self.state_embed(state)
-
             # handle no past action for first timestep
-
             if exists(actions):
                 action_embed = self.action_embed(actions)
             else:
                 action_embed = state_embed[:, 0:0] # empty action embed
 
+            # Action embedding seq shall be the same length as state (why summing them?)
             if action_embed.shape[-2] == (state_embed.shape[-2] - 1):
                 action_embed = pad_at_dim(action_embed, (1, 0), dim = 1)
 
+            # decoder cross attention (with previous layers hiddens), hiddens are used as KV cache!
             embed = state_embed + action_embed
-
             residual_stream, next_lower_hiddens = self.lower_body(embed, cache = lower_transformer_hiddens, return_hiddens = True)
 
         # meta controller acts on residual stream here
-
         with meta_controller_context():
-
             if exists(meta_controller):
                 control_signal, next_meta_hiddens = meta_controller(residual_stream, cache = meta_hiddens, discovery_phase = discovery_phase, temperature = meta_controller_temperature)
             else:
                 control_signal, next_meta_hiddens = self.zero, None
-
             modified_residual_stream = residual_stream + control_signal
 
         # modified residual stream sent back to transformer upper body
-
         with upper_transformer_context():
-
             attended, next_upper_hiddens = self.upper_body(modified_residual_stream, cache = upper_transformer_hiddens, return_hiddens = True)
-
             # head readout
-
             dist_params = self.action_readout(attended)
 
-        # maybe return behavior cloning loss
-
+        # Behaviour cloning
         if behavioral_cloning:
             state_dist_params = self.state_readout(attended)
             state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state)
-
             action_clone_loss = self.action_readout.calculate_loss(dist_params, target_actions)
-
             return state_clone_loss, action_clone_loss
 
+        # Discovery phase (of temporally-abstract actions)
         elif meta_controlling and discovery_phase:
-
             action_recon_loss = self.action_readout.calculate_loss(dist_params, target_actions)
-
             return action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.switch_loss
 
-        # returning
-
+        # Rollout: action distribution
         return_one = not (return_latents or return_cache)
-
         if return_one:
             return dist_params
-
         return dist_params, TransformerOutput(residual_stream, (next_lower_hiddens, next_meta_hiddens, next_upper_hiddens))

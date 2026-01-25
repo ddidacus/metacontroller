@@ -10,6 +10,13 @@ Implementation of the MetaController proposed in [Emergent temporal abstractions
 $ pip install metacontroller-pytorch
 ```
 
+## Training
+
+### Behavior cloning phase
+```shell
+$ python scripts/behavior_cloning.py --dataset_path trajectories.pt --out_path model.pt --batch_size 16
+```
+
 ## Appreciation
 
 - [Pranoy](https://github.com/pranoyr) for submitting a pull request for fixing the previous latent action not being included in the inputs to the switching unit

@@ -1,5 +1,10 @@
 replay-data/
 recordings/
+data/
+scripts/debug.py
+scripts/setup.sh
+*.out
+*.pt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
