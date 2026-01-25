@@ -1,10 +1,12 @@
 replay-data/
 recordings/
 data/
+wandb
 scripts/debug.py
 scripts/setup.sh
 *.out
 *.pt
+*.slurm
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
