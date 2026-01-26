@@ -128,7 +128,7 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
                 env.close()
                 return None, None, False, 0
 
-            episode_state[_step] = state_obs["rgb_image"]
+            episode_state[_step] = state_obs["rgb_image"] / 255. # normalizd to 0 to 1
             episode_action[_step] = action
 
             state_obs, reward, terminated, truncated, info = env.step(action)
