@@ -429,9 +429,8 @@ class Transformer(Module):
         # maybe return behavior cloning loss
 
         if behavioral_cloning:
-            loss_mask = None
-            if exists(episode_lens):
-                loss_mask = lens_to_mask(episode_lens, state.shape[1])
+
+            loss_mask = maybe(lens_to_mask)(episode_lens, state.shape[1])
 
             state_dist_params = self.state_readout(attended)
             state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = loss_mask)
