@@ -107,7 +107,6 @@ class MetaController(Module):
 
         self.switch_per_latent_dim = switch_per_latent_dim
 
-
         self.dim_latent = dim_latent
         self.switching_unit = GRU(dim_meta + dim_latent, dim_meta)
         self.to_switching_unit_beta = nn.Linear(dim_meta, dim_latent if switch_per_latent_dim else 1, bias = False)
@@ -146,6 +145,13 @@ class MetaController(Module):
             *self.action_proposer.parameters(),
             *self.action_proposer_mean_log_var.parameters()
         ]
+
+    def log_prob(
+        self,
+        action_dist,
+        sampled_latent_action
+    ):
+        return self.action_proposer_mean_log_var.log_prob(action_dist, sampled_latent_action)
 
     def forward(
         self,
@@ -275,6 +281,12 @@ class MetaController(Module):
         return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, switch_loss)
 
 # main transformer, which is subsumed into the environment after behavioral cloning
+
+Hiddens = namedtuple('Hiddens', (
+    'lower_body',
+    'meta_controller',
+    'upper_body'
+))
 
 TransformerOutput = namedtuple('TransformerOutput', (
     'residual_stream_latent',
@@ -441,4 +453,4 @@ class Transformer(Module):
         if return_one:
             return dist_params
 
-        return dist_params, TransformerOutput(residual_stream, (next_lower_hiddens, next_meta_hiddens, next_upper_hiddens))
+        return dist_params, TransformerOutput(residual_stream, Hiddens(next_lower_hiddens, next_meta_hiddens, next_upper_hiddens))

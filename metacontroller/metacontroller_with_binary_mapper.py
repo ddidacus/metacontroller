@@ -50,6 +50,9 @@ def default(*args):
 def straight_through(src, tgt):
     return tgt + src - src.detach()
 
+def log(t, eps = 1e-20):
+    return t.clamp_min(eps).log()
+
 # meta controller
 
 @save_load()
@@ -136,6 +139,23 @@ class MetaControllerWithBinaryMapper(Module):
             *self.action_proposer.parameters(),
             *self.proposer_to_binary_logits.parameters()
         ]
+
+    def log_prob(
+        self,
+        action_dist,
+        sampled_latent_action
+    ):
+        action_prob = action_dist.sigmoid()
+        probs = stack((action_prob, 1. - action_prob), dim = -1)
+        log_probs = log(probs)
+
+        indices = sampled_latent_action.argmax(dim = -1)
+        codes = self.binary_mapper.codes[indices].long()
+
+        codes = rearrange(codes, '... -> ... 1')
+        action_log_probs = log_probs.gather(-1, codes)
+
+        return rearrange(action_log_probs, '... 1 -> ...')
 
     def forward(
         self,

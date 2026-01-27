@@ -80,6 +80,12 @@ def test_metacontroller(
         assert logits.shape == (2, 1, *assert_shape)
         past_action_id = model.action_readout.sample(logits)
 
+        # get log prob from meta controller latent actions
+
+        meta_controller_hidden = cache.prev_hiddens.meta_controller
+
+        old_log_probs = meta_controller.log_prob(meta_controller_hidden.action_dist, meta_controller_hidden.actions)
+
     # evolutionary strategies over grpo
 
     model.meta_controller = meta_controller
