@@ -170,7 +170,7 @@ class MetaControllerWithBinaryMapper(Module):
         action_log_probs = log_probs.gather(-1, codes)
         action_log_probs = rearrange(action_log_probs, '... 1 -> ...')
 
-        return action_log_probs.sum(dim = -1)
+        return action_log_probs
 
     def forward(
         self,

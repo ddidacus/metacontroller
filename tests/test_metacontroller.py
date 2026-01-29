@@ -1,6 +1,7 @@
 import pytest
 param = pytest.mark.parametrize
 
+from shutil import rmtree
 from pathlib import Path
 from functools import partial
 
@@ -8,6 +9,8 @@ import torch
 from torch import cat
 from metacontroller.metacontroller import Transformer, MetaController, policy_loss, z_score
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
+
+from memmap_replay_buffer import ReplayBuffer
 
 from einops import rearrange
 
@@ -66,6 +69,12 @@ def test_metacontroller(
             dim_latent = 128,
             switch_per_latent_dim = switch_per_latent_dim
         )
+
+        field_shapes = dict(
+            log_probs = ('float', 128),
+            switch_betas = ('float', 128 if switch_per_latent_dim else 1),
+            latent_actions = ('float', 128)
+        )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
             dim_model = 512,
@@ -74,12 +83,35 @@ def test_metacontroller(
             dim_code_bits = 8, # 2 ** 8 = 256 codes
         )
 
+        field_shapes = dict(
+            log_probs = ('float', 8),
+            switch_betas = ('float', 8 if switch_per_latent_dim else 1),
+            latent_actions = ('float', 256)
+        )
+
     # discovery phase
 
     (action_recon_loss, kl_loss, switch_loss) = model(state, actions, meta_controller = meta_controller, discovery_phase = True, episode_lens = episode_lens)
     (action_recon_loss + kl_loss * 0.1 + switch_loss * 0.2).backward()
 
     # internal rl - done iteratively
+
+    # replay buffer
+
+    test_folder = './test-buffer-for-grpo'
+
+    replay_buffer = ReplayBuffer(
+        test_folder,
+        max_episodes = 3,
+        max_timesteps = 256,
+        fields = dict(
+            states = ('float', 512),
+            **field_shapes
+        ),
+        meta_fields = dict(
+            advantages = 'float'
+        )
+    )
 
     # simulate grpo
 
@@ -129,22 +161,35 @@ def test_metacontroller(
     # calculate advantages using z-score
 
     rewards = cat(all_rewards)
-    advantages = z_score(rewards)
+    group_advantages = z_score(rewards)
 
-    assert advantages.shape == (3,)
+    assert group_advantages.shape == (3,)
 
     # simulate a policy loss update over the entire group
 
     group_states, group_log_probs, group_switch_betas, group_latent_actions = map(partial(cat, dim = 0), zip(*all_episodes))
 
+    for states, log_probs, switch_betas, latent_actions, advantages in zip(group_states, group_log_probs, group_switch_betas, group_latent_actions, group_advantages):
+        replay_buffer.store_episode(
+            states = states,
+            log_probs = log_probs,
+            switch_betas = switch_betas,
+            latent_actions = latent_actions,
+            advantages = advantages
+        )
+
+    dl = replay_buffer.dataloader(batch_size = 3)
+
+    batch = next(iter(dl))
+
     loss = policy_loss(
         meta_controller,
-        group_states,
-        group_log_probs,
-        group_latent_actions,
-        advantages,
-        group_switch_betas == 1.,
-        episode_lens = episode_lens[:1].repeat(3) if exists(episode_lens) else None
+        batch['states'],
+        batch['log_probs'],
+        batch['latent_actions'],
+        batch['advantages'],
+        batch['switch_betas'] == 1.,
+        episode_lens = batch['_lens']
     )
 
     loss.backward()
@@ -167,3 +212,5 @@ def test_metacontroller(
 
     Path('./meta_controller.pt').unlink()
     Path('./trained.pt').unlink()
+
+    rmtree(test_folder, ignore_errors = True)
