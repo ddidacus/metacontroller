@@ -42,6 +42,18 @@ $ pip install metacontroller-pytorch
 ```
 
 ```bibtex
+@misc{hwang2025dynamicchunkingendtoendhierarchical,
+    title   = {Dynamic Chunking for End-to-End Hierarchical Sequence Modeling},
+    author  = {Sukjun Hwang and Brandon Wang and Albert Gu},
+    year    = {2025},
+    eprint  = {2507.07955},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2507.07955},
+}
+```
+
+```bibtex
 @misc{fleuret2025freetransformer,
     title     = {The Free Transformer}, 
     author    = {François Fleuret},
