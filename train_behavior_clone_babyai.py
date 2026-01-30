@@ -130,8 +130,8 @@ def train(
     for epoch in range(cloning_epochs + discovery_epochs):
 
         model.train()
-        total_state_loss = 0.
-        total_action_loss = 0.
+        from collections import defaultdict
+        total_losses = defaultdict(float)
 
         progress_bar = tqdm(dataloader, desc = f"Epoch {epoch}", disable = not accelerator.is_local_main_process)
 
@@ -200,9 +200,9 @@ def train(
                 optim.zero_grad()
 
             # log
-
-            total_state_loss += state_loss.item()
-            total_action_loss += action_loss.item()
+            
+            for key, value in log.items():
+                total_losses[key] += value
 
             accelerator.log({
                 **log,
@@ -210,15 +210,11 @@ def train(
                 "grad_norm": grad_norm.item()
             })
 
-            progress_bar.set_postfix(
-                state_loss = state_loss.item(),
-                action_loss = action_loss.item()
-            )
+            progress_bar.set_postfix(**log)
 
-        avg_state_loss = total_state_loss / len(dataloader)
-        avg_action_loss = total_action_loss / len(dataloader)
-
-        accelerator.print(f"Epoch {epoch}: state_loss={avg_state_loss:.4f}, action_loss={avg_action_loss:.4f}")
+        avg_losses = {k: v / len(dataloader) for k, v in total_losses.items()}
+        avg_losses_str = ", ".join([f"{k}={v:.4f}" for k, v in avg_losses.items()])
+        accelerator.print(f"Epoch {epoch}: {avg_losses_str}")
 
     # save weights
 
@@ -231,7 +227,7 @@ def train(
         unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
         unwrapped_meta_controller.save(meta_controller_checkpoint_path)
 
-        accelerator.print(f"Model saved to {checkpoint_path}, MetaControler to {meta_controller_checkpoint_path}")
+        accelerator.print(f"Model saved to {checkpoint_path}, MetaController to {meta_controller_checkpoint_path}")
 
     accelerator.end_training()
 

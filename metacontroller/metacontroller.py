@@ -408,6 +408,7 @@ class Transformer(Module):
         meta_controller: Module | None = None,
         cache: TransformerOutput | None = None,
         discovery_phase = False,
+        force_behavior_cloning = False,
         meta_controller_temperature = 1.,
         return_raw_action_dist = False,
         return_latents = False,
@@ -420,11 +421,15 @@ class Transformer(Module):
 
         meta_controller = default(meta_controller, self.meta_controller)
 
+        if force_behavior_cloning:
+            assert not discovery_phase, 'discovery phase cannot be set to True if force behavioral cloning is set to True'
+            meta_controller = None
+
         has_meta_controller = exists(meta_controller)
 
         assert not (discovery_phase and not has_meta_controller), 'meta controller must be made available during discovery phase'
 
-        behavioral_cloning = not has_meta_controller and not return_raw_action_dist
+        behavioral_cloning = force_behavior_cloning or (not has_meta_controller and not return_raw_action_dist)
 
         # by default, if meta controller is passed in, transformer is no grad
 
@@ -472,7 +477,7 @@ class Transformer(Module):
 
         with meta_controller_context():
 
-            if exists(meta_controller):
+            if exists(meta_controller) and not behavioral_cloning:
                 control_signal, next_meta_hiddens = meta_controller(residual_stream, cache = meta_hiddens, discovery_phase = discovery_phase, temperature = meta_controller_temperature, episode_lens = episode_lens)
             else:
                 control_signal, next_meta_hiddens = self.zero, None
