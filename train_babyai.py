@@ -57,22 +57,23 @@ def default(v, d):
 # main
 
 def main(
-    env_name: str = 'BabyAI-BossLevel-v0',
-    num_episodes: int = int(10e6),
-    max_timesteps: int = 500,
-    buffer_size: int = 5_000,
-    render_every_eps: int = 1_000,
-    video_folder: str = './recordings',
+    env_name = 'BabyAI-BossLevel-v0',
+    num_episodes = int(10e6),
+    max_timesteps = 500,
+    buffer_size = 5_000,
+    render_every_eps = 1_000,
+    video_folder = './recordings',
     seed: int | None = None,
     transformer_weights_path: str | None = None,
     meta_controller_weights_path: str | None = None,
-    output_meta_controller_path: str = 'metacontroller_rl_trained.pt',
-    use_resnet: bool = False,
-    lr: float = 1e-4,
-    num_groups: int = 16,
-    max_grad_norm: float = 1.0,
-    use_wandb: bool = False,
-    wandb_project: str = 'metacontroller-babyai-rl'
+    output_meta_controller_path = 'metacontroller_rl_trained.pt',
+    use_resnet = False,
+    lr = 1e-4,
+    batch_size = 16,
+    num_groups = 16,
+    max_grad_norm = 1.0,
+    use_wandb = False,
+    wandb_project = 'metacontroller-babyai-rl'
 ):
     # accelerator
 
@@ -263,7 +264,7 @@ def main(
         # learn
 
         if len(replay_buffer) >= buffer_size:
-            dl = replay_buffer.dataloader(batch_size = num_groups)
+            dl = replay_buffer.dataloader(batch_size = batch_size)
             dl = accelerator.prepare(dl)
 
             meta_controller.train()
