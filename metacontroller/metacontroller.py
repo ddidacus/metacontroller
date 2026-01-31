@@ -66,6 +66,13 @@ MetaControllerOutput = namedtuple('MetaControllerOutput', (
     'switch_loss'
 ))
 
+GRPOOutput = namedtuple('GRPOOutput', (
+    'state',
+    'action',
+    'log_prob',
+    'switch_beta'
+))
+
 def z_score(t, eps = 1e-8):
     return (t - t.mean()) / (t.std() + eps)
 
@@ -106,6 +113,17 @@ def policy_loss(
         mask = mask & episode_mask
 
     return masked_mean(losses, mask)
+
+def extract_grpo_data(meta_controller, transformer_output):
+    meta_output = transformer_output.prev_hiddens.meta_controller
+
+    state = meta_output.input_residual_stream
+    action = meta_output.actions
+    switch_beta = meta_output.switch_beta
+
+    log_prob = meta_controller.log_prob(meta_output.action_dist, action)
+
+    return GRPOOutput(state, action, log_prob, switch_beta)
 
 @save_load()
 class MetaController(Module):

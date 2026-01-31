@@ -26,7 +26,7 @@ from accelerate import Accelerator
 
 from babyai_env import create_env
 from memmap_replay_buffer import ReplayBuffer
-from metacontroller.metacontroller import Transformer, MetaController, policy_loss, z_score
+from metacontroller.metacontroller import Transformer, MetaController, policy_loss, z_score, extract_grpo_data
 from metacontroller.transformer_with_resnet import TransformerWithResnet
 
 # research entry point
@@ -195,13 +195,12 @@ def main(
 
                 # GRPO collection
 
-                meta_output = cache.prev_hiddens.meta_controller
-                old_log_probs = unwrapped_meta_controller.log_prob(meta_output.action_dist, meta_output.actions)
+                grpo_data = extract_grpo_data(unwrapped_meta_controller, cache)
 
-                states.append(meta_output.input_residual_stream)
-                log_probs.append(old_log_probs)
-                switch_betas.append(meta_output.switch_beta)
-                latent_actions.append(meta_output.actions)
+                states.append(grpo_data.state)
+                log_probs.append(grpo_data.log_prob)
+                switch_betas.append(grpo_data.switch_beta)
+                latent_actions.append(grpo_data.action)
 
                 next_state, reward, terminated, truncated, *_ = env.step(action.cpu().numpy())
 

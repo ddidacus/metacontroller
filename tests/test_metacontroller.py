@@ -7,7 +7,7 @@ from functools import partial
 
 import torch
 from torch import cat
-from metacontroller.metacontroller import Transformer, MetaController, policy_loss, z_score
+from metacontroller.metacontroller import Transformer, MetaController, policy_loss, z_score, extract_grpo_data
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
 from memmap_replay_buffer import ReplayBuffer
@@ -109,10 +109,7 @@ def test_metacontroller(
         cache = None
         past_action_id = None
 
-        states = []
-        log_probs = []
-        switch_betas = []
-        latent_actions = []
+        grpo_data_list = []
 
         for one_state in subset_state.unbind(dim = 1):
             one_state = rearrange(one_state, 'b d -> b 1 d')
@@ -121,24 +118,19 @@ def test_metacontroller(
 
             past_action_id = model.action_readout.sample(logits)
 
-            # get log prob from meta controller latent actions
+            # extract grpo data and store
 
-            meta_output = cache.prev_hiddens.meta_controller
-
-            old_log_probs = meta_controller.log_prob(meta_output.action_dist, meta_output.actions)
-
-            states.append(meta_output.input_residual_stream)
-            log_probs.append(old_log_probs)
-            switch_betas.append(meta_output.switch_beta)
-            latent_actions.append(meta_output.actions)
+            grpo_data_list.append(extract_grpo_data(meta_controller, cache))
 
         # accumulate across time for the episode data
+
+        states, actions, log_probs, switch_betas = zip(*grpo_data_list)
 
         all_episodes.append((
             cat(states, dim = 1),
             cat(log_probs, dim = 1),
             cat(switch_betas, dim = 1),
-            cat(latent_actions, dim = 1)
+            cat(actions, dim = 1)
         ))
 
         all_rewards.append(torch.randn(1))
