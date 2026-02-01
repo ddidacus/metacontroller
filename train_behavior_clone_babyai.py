@@ -186,7 +186,7 @@ def train(
                     actions,
                     episode_lens = episode_lens,
                     discovery_phase = is_discovering,
-                    meta_controller = meta_controller if is_discovering else None
+                    force_behavior_cloning = not is_discovering
                 )
 
                 if is_discovering:
