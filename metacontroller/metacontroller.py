@@ -407,9 +407,18 @@ class Transformer(Module):
 
         # meta controller
 
-        self.meta_controller = meta_controller
+        self.meta_controller = meta_controller 
 
         self.register_buffer('zero', tensor(0.), persistent = False)
+
+        # ensure devices match
+        
+        if exists(self.meta_controller): self._ensure_consistent_device(self.meta_controller)
+
+    def _ensure_consistent_device(self, network):
+        self.model_device = next(self.parameters()).device
+        if next(network.parameters()).device != self.model_device:
+            network.to(self.model_device)
 
     def evolve(
         self,
@@ -446,6 +455,8 @@ class Transformer(Module):
         device = state.device
 
         # meta controller is either given or already given at init
+
+        if exists(meta_controller): self._ensure_consistent_device(meta_controller)
 
         meta_controller = default(meta_controller, self.meta_controller)
 

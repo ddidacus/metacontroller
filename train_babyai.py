@@ -6,7 +6,8 @@
 #   "memmap-replay-buffer>=0.0.12",
 #   "metacontroller-pytorch",
 #   "minigrid",
-#   "tqdm"
+#   "tqdm",
+#   "wandb"
 # ]
 # ///
 
@@ -297,10 +298,11 @@ def main(
 
             accelerator.log({
                 'loss': loss.item(),
-                'grad_norm': grad_norm.item()
+                'grad_norm': grad_norm.item(),
+                'reward': cumulative_rewards.mean().item()
             })
 
-            accelerator.print(f'loss: {loss.item():.4f}, grad_norm: {grad_norm.item():.4f}')
+            accelerator.print(f'loss: {loss.item():.4f}, grad_norm: {grad_norm.item():.4f}, reward: {cumulative_rewards.mean().item():.4f}')
 
     env.close()
 
