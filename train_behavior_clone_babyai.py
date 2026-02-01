@@ -39,7 +39,8 @@ def train(
     env_id = "BabyAI-MiniBossLevel-v0",
     cloning_epochs = 10,
     discovery_epochs = 10,
-    batch_size = 1024,
+    batch_size = 128,
+    gradient_accumulation_steps = None, 
     lr = 1e-4,
     discovery_lr = 1e-4,
     weight_decay = 0.03,
@@ -121,6 +122,10 @@ def train(
 
     accelerator.print(f"Detected state_dim: {state_dim}, num_actions: {num_actions} from env: {env_id}")
 
+    # meta controller
+
+    meta_controller = MetaController(dim)
+
     # transformer
     
     transformer_class = TransformerWithResnet if use_resnet else Transformer
@@ -130,12 +135,9 @@ def train(
         state_embed_readout = dict(num_continuous = state_dim),
         action_embed_readout = dict(num_discrete = num_actions),
         lower_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
-        upper_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head)
+        upper_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
+        meta_controller = meta_controller
     )
-
-    # meta controller
-
-    meta_controller = MetaController(dim)
 
     # optimizer
 
@@ -214,14 +216,19 @@ def train(
                         action_loss = action_loss.item(),
                     )
 
+                # gradient accumulation
+
+                if gradient_accumulation_steps is not None: loss /= gradient_accumulation_steps
+
                 # backprop
 
                 accelerator.backward(loss)
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm = max_grad_norm)
 
-                optim.step()
-                optim.zero_grad()
+                if gradient_accumulation_steps is None or gradient_step % gradient_accumulation_steps == 0:
+                    optim.step()
+                    optim.zero_grad()
 
             # log
             
