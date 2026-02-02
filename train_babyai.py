@@ -18,7 +18,7 @@ from shutil import rmtree
 from tqdm import tqdm
 
 import torch
-from torch import cat, tensor, stack
+from torch import cat, tensor, stack, Tensor
 from torch.optim import Adam
 
 from einops import rearrange
@@ -33,10 +33,11 @@ from metacontroller.transformer_with_resnet import TransformerWithResnet
 # research entry point
 
 def reward_shaping_fn(
-    cumulative_rewards: torch.Tensor,
-    all_rewards: torch.Tensor,
-    episode_lens: torch.Tensor
-) -> torch.Tensor | None:
+    cumulative_rewards: Tensor,
+    all_rewards: Tensor,
+    episode_lens: Tensor,
+    reject_threshold_cumulative_reward_variance: float = 0.
+) -> Tensor | None:
     """
     researchers can modify this function to engineer rewards
     or return None to reject the entire batch
@@ -45,6 +46,8 @@ def reward_shaping_fn(
     all_rewards: (num_episodes, max_timesteps)
     episode_lens: (num_episodes,)
     """
+    if cumulative_rewards.var() < reject_threshold_cumulative_reward_variance:
+        return None
     return cumulative_rewards
 
 # helpers
@@ -69,12 +72,14 @@ def main(
     meta_controller_weights_path: str | None = None,
     output_meta_controller_path = 'metacontroller_rl_trained.pt',
     use_resnet = False,
+    num_epochs = 3,
     lr = 1e-4,
     batch_size = 16,
     num_groups = 16,
     max_grad_norm = 1.0,
     use_wandb = False,
-    wandb_project = 'metacontroller-babyai-rl'
+    wandb_project = 'metacontroller-babyai-rl',
+    reject_threshold_cumulative_reward_variance = 0.
 ):
     # accelerator
 
@@ -237,16 +242,22 @@ def main(
         # pad step rewards
 
         max_len = max(all_episode_lens)
-        padded_step_rewards = torch.zeros(num_episodes, max_len)
+        padded_step_rewards = torch.zeros(num_groups, max_len)
 
         for i, (rewards, length) in enumerate(zip(all_step_rewards, all_episode_lens)):
             padded_step_rewards[i, :length] = rewards
 
         # reward shaping hook
 
-        shaped_rewards = reward_shaping_fn(cumulative_rewards, padded_step_rewards, episode_lens)
+        shaped_rewards = reward_shaping_fn(
+            cumulative_rewards,
+            padded_step_rewards,
+            episode_lens,
+            reject_threshold_cumulative_reward_variance = reject_threshold_cumulative_reward_variance
+        )
 
         if not exists(shaped_rewards):
+            accelerator.print(f'group rejected - variance of {cumulative_rewards.var().item():.4f} is lower than threshold of {reject_threshold_cumulative_reward_variance}')
             continue
 
         group_advantages = z_score(shaped_rewards)
@@ -265,42 +276,43 @@ def main(
         # learn
 
         if len(replay_buffer) >= buffer_size:
-            dl = replay_buffer.dataloader(batch_size = batch_size)
+            dl = replay_buffer.dataloader(batch_size = batch_size, shuffle = True)
             dl = accelerator.prepare(dl)
 
             meta_controller.train()
 
-            batch = next(iter(dl))
+            for epoch in range(num_epochs):
+                for batch in dl:
+                    loss = meta_controller.policy_loss(
+                        batch['states'],
+                        batch['log_probs'],
+                        batch['latent_actions'],
+                        batch['advantages'],
+                        batch['switch_betas'] == 1.,
+                        episode_lens = batch['_lens']
+                    )
 
-            loss = meta_controller.policy_loss(
-                batch['states'],
-                batch['log_probs'],
-                batch['latent_actions'],
-                batch['advantages'],
-                batch['switch_betas'] == 1.,
-                episode_lens = batch['_lens']
-            )
+                    accelerator.backward(loss)
 
-            accelerator.backward(loss)
+                    grad_norm = accelerator.clip_grad_norm_(meta_controller.parameters(), max_grad_norm)
 
-            grad_norm = accelerator.clip_grad_norm_(meta_controller.parameters(), max_grad_norm)
+                    optim.step()
+                    optim.zero_grad()
 
-            optim.step()
-            optim.zero_grad()
+                    pbar.set_postfix(
+                        epoch = epoch,
+                        loss = f'{loss.item():.4f}',
+                        grad_norm = f'{grad_norm.item():.4f}',
+                        reward = f'{cumulative_rewards.mean().item():.4f}'
+                    )
+
+                    accelerator.log({
+                        'loss': loss.item(),
+                        'grad_norm': grad_norm.item(),
+                        'reward': cumulative_rewards.mean().item()
+                    })
 
             meta_controller.eval()
-
-            pbar.set_postfix(
-                loss = f'{loss.item():.4f}',
-                grad_norm = f'{grad_norm.item():.4f}',
-                reward = f'{cumulative_rewards.mean().item():.4f}'
-            )
-
-            accelerator.log({
-                'loss': loss.item(),
-                'grad_norm': grad_norm.item(),
-                'reward': cumulative_rewards.mean().item()
-            })
 
             accelerator.print(f'loss: {loss.item():.4f}, grad_norm: {grad_norm.item():.4f}, reward: {cumulative_rewards.mean().item():.4f}')
 
