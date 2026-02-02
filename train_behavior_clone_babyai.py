@@ -110,11 +110,13 @@ def train(
 
     # state shape and action dimension
     # state: (B, T, H, W, C) or (B, T, D)
+
     state_shape = replay_buffer.shapes['state']
     if use_resnet: state_dim = 256
     else: state_dim = int(torch.tensor(state_shape).prod().item())
 
     # deduce num_actions from the environment
+
     from babyai_env import create_env
     temp_env = create_env(env_id)
     num_actions = int(temp_env.action_space.n)
@@ -181,12 +183,13 @@ def train(
 
 
             with accelerator.accumulate(model):
-                losses = model(
+                losses, meta_controller_output = model(
                     states,
                     actions,
                     episode_lens = episode_lens,
                     discovery_phase = is_discovering,
-                    force_behavior_cloning = not is_discovering
+                    force_behavior_cloning = not is_discovering,
+                    return_meta_controller_output = True
                 )
 
                 if is_discovering:
@@ -201,7 +204,8 @@ def train(
                     log = dict(
                         action_recon_loss = action_recon_loss.item(),
                         kl_loss = kl_loss.item(),
-                        switch_loss = switch_loss.item()
+                        switch_loss = switch_loss.item(),
+                        switch_density = meta_controller_output.switch_beta.mean().item()
                     )
                 else:
                     state_loss, action_loss = losses

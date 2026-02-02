@@ -54,6 +54,19 @@ def default(*args):
 def straight_through(src, tgt):
     return tgt + src - src.detach()
 
+# losses
+
+BehavioralCloningLosses = namedtuple('BehavioralCloningLosses', (
+    'state',
+    'action'
+))
+
+DiscoveryLosses = namedtuple('DiscoveryLosses', (
+    'action_recon',
+    'kl',
+    'switch'
+))
+
 # meta controller
 
 MetaControllerOutput = namedtuple('MetaControllerOutput', (
@@ -450,7 +463,8 @@ class Transformer(Module):
         return_raw_action_dist = False,
         return_latents = False,
         return_cache = False,
-        episode_lens: Tensor | None = None
+        episode_lens: Tensor | None = None,
+        return_meta_controller_output = False
     ):
         device = state.device
 
@@ -544,13 +558,23 @@ class Transformer(Module):
 
             action_clone_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = loss_mask)
 
-            return state_clone_loss, action_clone_loss
+            losses = BehavioralCloningLosses(state_clone_loss, action_clone_loss)
+
+            if not return_meta_controller_output:
+                return losses
+
+            return losses, next_meta_hiddens
 
         elif discovery_phase:
 
             action_recon_loss = self.action_readout.calculate_loss(dist_params, target_actions)
 
-            return action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.switch_loss
+            losses = DiscoveryLosses(action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.switch_loss)
+
+            if not return_meta_controller_output:
+                return losses
+
+            return losses, next_meta_hiddens
 
         # returning
 
