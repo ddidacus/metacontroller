@@ -3,7 +3,7 @@
 #   "fire",
 #   "gymnasium",
 #   "gymnasium[other]",
-#   "metacontroller-pytorch>=0.0.48",
+#   "metacontroller-pytorch>=0.0.49",
 #   "minigrid",
 #   "tqdm",
 #   "x-evolution",
@@ -96,8 +96,9 @@ class BabyAIEnvironment(Module):
         if self.condition_on_mission_embed:
             mission = self.env.unwrapped.mission
             mission_embed = get_mission_embedding(mission)
-
-            # todo - accept this
+            mission_embed = mission_embed.to(device)
+            if mission_embed.ndim == 1:
+                mission_embed = mission_embed.unsqueeze(0)
 
         step = 0
         cache = None
@@ -130,7 +131,8 @@ class BabyAIEnvironment(Module):
                     past_action_id,
                     return_cache = True,
                     return_raw_action_dist = True,
-                    cache = cache
+                    cache = cache,
+                    condition = mission_embed if self.condition_on_mission_embed else None
                 )
 
             action = unwrapped_model.action_readout.sample(logits)

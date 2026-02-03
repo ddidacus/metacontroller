@@ -4,7 +4,7 @@
 #   "gymnasium",
 #   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.12",
-#   "metacontroller-pytorch>=0.0.48",
+#   "metacontroller-pytorch>=0.0.49",
 #   "minigrid",
 #   "tqdm",
 #   "wandb",
@@ -173,8 +173,9 @@ def main(
             if condition_on_mission_embed:
                 mission = env.unwrapped.mission
                 mission_embed = get_mission_embedding(mission)
-
-                # todo - accept this
+                mission_embed = mission_embed.to(accelerator.device)
+                if mission_embed.ndim == 1:
+                    mission_embed = mission_embed.unsqueeze(0)
 
             cache = None
             past_action_id = None
@@ -209,7 +210,8 @@ def main(
                         meta_controller = unwrapped_meta_controller,
                         return_cache = True,
                         return_raw_action_dist = True,
-                        cache = cache
+                        cache = cache,
+                        condition = mission_embed if condition_on_mission_embed else None
                     )
 
                 action = unwrapped_model.action_readout.sample(logits)

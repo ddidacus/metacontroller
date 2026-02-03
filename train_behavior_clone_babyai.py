@@ -3,7 +3,7 @@
 #   "accelerate",
 #   "fire",
 #   "memmap-replay-buffer>=0.0.23",
-#   "metacontroller-pytorch>=0.0.48",
+#   "metacontroller-pytorch>=0.0.49",
 #   "torch",
 #   "einops",
 #   "tqdm",
@@ -33,6 +33,14 @@ from babyai_env import get_mission_embedding
 
 import minigrid
 import gymnasium as gym
+
+# helpers
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
 
 # TODO: loss is still ~300 and it could be the resnet output?
 # TODO: changelog (paper hparams, checkpointing, difficulty levels in trajectory collection)
@@ -64,15 +72,20 @@ def train(
     discovery_switch_loss_weight = 1.,
     max_grad_norm = 1.,
     use_resnet = False,
-    condition_on_mission_embed = False
+    condition_on_mission_embed = False,
+    mission_embed_dim = 384
 ):
 
-    def store_checkpoint(step:int):
+    def store_checkpoint(step:int | None = None):
         if accelerator.is_main_process:
 
-            # Add step to checkpoint filenames
-            checkpoint_path_with_step = checkpoint_path.replace('.pt', f'_step_{step}.pt')
-            meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path.replace('.pt', f'_step_{step}.pt')
+            if exists(step):
+                # Add step to checkpoint filenames
+                checkpoint_path_with_step = checkpoint_path.replace('.pt', f'_step_{step}.pt')
+                meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path.replace('.pt', f'_step_{step}.pt')
+            else:
+                checkpoint_path_with_step = checkpoint_path
+                meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path
 
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.save(checkpoint_path_with_step)
@@ -142,7 +155,8 @@ def train(
         action_embed_readout = dict(num_discrete = num_actions),
         lower_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
         upper_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
-        meta_controller = meta_controller
+        meta_controller = meta_controller,
+        dim_condition = mission_embed_dim if condition_on_mission_embed else None
     )
 
     # optimizer
@@ -177,11 +191,12 @@ def train(
             states = batch['state'].float()
             actions = batch['action'].long()
             episode_lens = batch.get('_lens')
-            missions = batch.get('mission')
+            mission_embeddings = batch.get('mission_embedding')
 
-            if condition_on_mission_embed and exists(missions):
-                # missions in batch might be a list of strings
-                mission_embeddings = get_missions_embeddings(missions)
+            if condition_on_mission_embed and exists(mission_embeddings):
+                mission_embeddings = mission_embeddings.to(accelerator.device)
+            else:
+                mission_embeddings = None
 
             # use resnet18 to embed visual observations
 
@@ -198,7 +213,8 @@ def train(
                     episode_lens = episode_lens,
                     discovery_phase = is_discovering,
                     force_behavior_cloning = not is_discovering,
-                    return_meta_controller_output = True
+                    return_meta_controller_output = True,
+                    condition = mission_embeddings
                 )
 
                 if is_discovering:
@@ -269,7 +285,7 @@ def train(
 
     # save weights
     accelerator.wait_for_everyone()
-    store_checkpoint(gradient_step)
+    store_checkpoint()
 
     accelerator.end_training()
 

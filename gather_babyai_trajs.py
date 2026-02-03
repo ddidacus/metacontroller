@@ -5,7 +5,8 @@
 #   "tqdm",
 #   "fire",
 #   "memmap-replay-buffer>=0.0.23",
-#   "loguru"
+#   "loguru",
+#   "sentence-transformers"
 # ]
 # ///
 
@@ -28,6 +29,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import torch
 import minigrid
 import gymnasium as gym
+from babyai_env import get_mission_embedding
 from minigrid.utils.baby_ai_bot import BabyAIBot
 from minigrid.wrappers import FullyObsWrapper, SymbolicObsWrapper
 
@@ -167,7 +169,7 @@ class BabyAIBotEpsilonGreedy:
 def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_shape):
     """
     Collect a single episode of demonstrations.
-    Returns tuple of (episode_state, episode_action, success, episode_length)
+    Returns tuple of (episode_state, episode_action, success, episode_length, mission_embedding)
     """
     if env_id not in gym.envs.registry:
         minigrid.register_minigrid_envs()
@@ -179,7 +181,8 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
 
     try:
         state_obs, _ = env.reset(seed=seed)
-        
+        mission = env.unwrapped.mission
+        mission_embedding = get_mission_embedding(mission).cpu().numpy()
         episode_state = np.zeros((num_steps, *state_shape), dtype=np.float32)
         episode_action = np.zeros(num_steps, dtype=np.float32)
 
@@ -190,7 +193,7 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
                 action = expert(state_obs)
             except Exception:
                 env.close()
-                return None, None, False, 0
+                return None, None, False, 0, None
 
             episode_state[_step] = state_obs["rgb_image"]
             episode_action[_step] = action
@@ -199,14 +202,14 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
 
             if terminated:
                 env.close()
-                return episode_state, episode_action, True, _step + 1
+                return episode_state, episode_action, True, _step + 1, mission_embedding
 
         env.close()
-        return episode_state, episode_action, False, num_steps
+        return episode_state, episode_action, False, num_steps, mission_embedding
 
     except Exception:
         env.close()
-        return None, None, False, 0
+        return None, None, False, 0, None
 
 def collect_demonstrations(
     env_id = "BabyAI-MiniBossLevel-v0",
@@ -216,7 +219,8 @@ def collect_demonstrations(
     random_action_prob = 0.05,
     num_workers = None,
     difficulty = "easy",
-    output_dir = "babyai-minibosslevel-trajectories"
+    output_dir = "babyai-minibosslevel-trajectories",
+    mission_embed_dim = 384
 ):
     """
     The BabyAI Bot should be able to solve all BabyAI environments,
@@ -257,11 +261,16 @@ def collect_demonstrations(
         'action': ('float', ())
     }
 
+    meta_fields = {
+        'mission_embedding': ('float', (mission_embed_dim,))
+    }
+
     buffer = ReplayBuffer(
         folder = output_folder,
         max_episodes = total_episodes,
         max_timesteps = num_steps,
         fields = fields,
+        meta_fields = meta_fields,
         overwrite = True
     )
 
@@ -289,12 +298,13 @@ def collect_demonstrations(
 
             for future in done:
                 del futures[future]
-                episode_state, episode_action, success, episode_length = future.result()
+                episode_state, episode_action, success, episode_length, mission_embedding = future.result()
 
                 if success and exists(episode_state):
                     buffer.store_episode(
                         state = episode_state[:episode_length],
-                        action = episode_action[:episode_length]
+                        action = episode_action[:episode_length],
+                        mission_embedding = mission_embedding
                     )
                     successful += 1
 
