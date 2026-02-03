@@ -4,10 +4,11 @@
 #   "gymnasium",
 #   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.12",
-#   "metacontroller-pytorch",
+#   "metacontroller-pytorch>=0.0.48",
 #   "minigrid",
 #   "tqdm",
-#   "wandb"
+#   "wandb",
+#   "sentence-transformers"
 # ]
 # ///
 
@@ -27,7 +28,7 @@ from torch_einops_utils import pad_sequence
 
 from accelerate import Accelerator
 
-from babyai_env import create_env
+from babyai_env import create_env, get_mission_embedding
 
 from memmap_replay_buffer import ReplayBuffer
 
@@ -87,7 +88,8 @@ def main(
     max_grad_norm = 1.0,
     use_wandb = False,
     wandb_project = 'metacontroller-babyai-rl',
-    reject_threshold_cumulative_reward_variance = 0.
+    reject_threshold_cumulative_reward_variance = 0.,
+    condition_on_mission_embed = False
 ):
     # accelerator
 
@@ -167,6 +169,12 @@ def main(
         for _ in range(num_groups):
 
             state, *_ = env.reset(seed = group_seed)
+
+            if condition_on_mission_embed:
+                mission = env.unwrapped.mission
+                mission_embed = get_mission_embedding(mission)
+
+                # todo - accept this
 
             cache = None
             past_action_id = None

@@ -1,6 +1,6 @@
 [project]
 name = "metacontroller-pytorch"
-version = "0.0.48"
+version = "0.0.49"
 description = "Transformer Metacontroller"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -30,7 +30,6 @@ dependencies = [
     "einops>=0.8.1",
     "loguru",
     "memmap-replay-buffer>=0.0.25",
-    "minGRU-pytorch",
     "torch>=2.5",
     "torch-einops-utils>=0.0.19",
     "vector-quantize-pytorch>=1.27.20",
@@ -46,12 +45,13 @@ Repository = "https://github.com/lucidrains/metacontroller"
 [project.optional-dependencies]
 examples = []
 test = [
-    "pytest"
+    "pytest",
+    "minGRU-pytorch"
 ]
 
 [tool.pytest.ini_options]
 pythonpath = [
-  "."
+    "."
 ]
 
 [build-system]

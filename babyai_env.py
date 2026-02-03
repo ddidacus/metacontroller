@@ -1,9 +1,49 @@
+import torch
+from functools import lru_cache
 from pathlib import Path
 from shutil import rmtree
 
 import gymnasium as gym
 import minigrid
 from minigrid.wrappers import FullyObsWrapper, SymbolicObsWrapper
+
+from sentence_transformers import SentenceTransformer
+
+# sbert
+
+_sbert = None
+
+def get_sbert():
+    global _sbert
+    if _sbert is None:
+        _sbert = SentenceTransformer('all-MiniLM-L6-v2')
+    return _sbert
+
+@lru_cache(maxsize = 1000)
+def get_mission_embedding(mission: str):
+    sbert = get_sbert()
+    embedding = sbert.encode(mission, convert_to_tensor = True)
+    return embedding
+
+_mission_cache = {}
+
+def get_missions_embeddings(missions: list[str]):
+    sbert = get_sbert()
+    
+    # identify uncached missions
+    
+    unique_missions = list(set(missions))
+    uncached_missions = [m for m in unique_missions if m not in _mission_cache]
+    
+    if len(uncached_missions) > 0:
+        embeddings = sbert.encode(uncached_missions, convert_to_tensor = True)
+        
+        for mission, embedding in zip(uncached_missions, embeddings):
+            _mission_cache[mission] = embedding
+
+    # return stacked embeddings
+
+    return torch.stack([_mission_cache[m] for m in missions])
 
 # functions
 

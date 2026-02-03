@@ -3,13 +3,14 @@
 #   "accelerate",
 #   "fire",
 #   "memmap-replay-buffer>=0.0.23",
-#   "metacontroller-pytorch",
+#   "metacontroller-pytorch>=0.0.48",
 #   "torch",
 #   "einops",
 #   "tqdm",
 #   "wandb",
 #   "gymnasium",
-#   "minigrid"
+#   "minigrid",
+#   "sentence-transformers"
 # ]
 # ///
 
@@ -25,8 +26,10 @@ from accelerate import Accelerator
 from memmap_replay_buffer import ReplayBuffer
 from einops import rearrange
 
-from metacontroller.metacontroller import Transformer, MetaController
+from metacontroller import MetaController, Transformer
 from metacontroller.transformer_with_resnet import TransformerWithResnet
+
+from babyai_env import get_mission_embedding
 
 import minigrid
 import gymnasium as gym
@@ -60,7 +63,8 @@ def train(
     discovery_kl_loss_weight = 1.,
     discovery_switch_loss_weight = 1.,
     max_grad_norm = 1.,
-    use_resnet = False
+    use_resnet = False,
+    condition_on_mission_embed = False
 ):
 
     def store_checkpoint(step:int):
@@ -173,6 +177,11 @@ def train(
             states = batch['state'].float()
             actions = batch['action'].long()
             episode_lens = batch.get('_lens')
+            missions = batch.get('mission')
+
+            if condition_on_mission_embed and exists(missions):
+                # missions in batch might be a list of strings
+                mission_embeddings = get_missions_embeddings(missions)
 
             # use resnet18 to embed visual observations
 
