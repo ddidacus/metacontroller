@@ -27,6 +27,7 @@ def exists(v):
     (False, True),
     (True, False)
 ])
+@param('accept_condition', (False, True))
 @param('action_discrete', (False, True))
 @param('variable_length', (False, True))
 @param('use_mingru', (False, True))
@@ -35,7 +36,8 @@ def test_metacontroller(
     switch_per_latent_dim,
     action_discrete,
     variable_length,
-    use_mingru
+    use_mingru,
+    accept_condition
 ):
 
     state = torch.randn(2, 128, 384)
@@ -50,6 +52,18 @@ def test_metacontroller(
         action_embed_readout = dict(num_continuous = 8)
         assert_shape = (8, 2)
 
+    # maybe conditioning
+
+    condition = None
+    condition_kwargs = dict()
+
+    if accept_condition:
+        condition_kwargs = dict(
+            dim_condition = 384,
+        )
+
+        condition = torch.randn(2, 384)
+
     # behavioral cloning phase
 
     model = Transformer(
@@ -58,19 +72,26 @@ def test_metacontroller(
         state_embed_readout = dict(num_continuous = 384),
         lower_body = dict(depth = 2,),
         upper_body = dict(depth = 2,),
+        **condition_kwargs
     )
 
-    state_clone_loss, action_clone_loss = model(state, actions, episode_lens = episode_lens)
+    state_clone_loss, action_clone_loss = model(state, actions, condition = condition, episode_lens = episode_lens)
     (state_clone_loss + 0.5 * action_clone_loss).backward()
 
     # discovery and internal rl phase with meta controller
 
     dim_meta = 256
-    action_proposer = ActionProposerWrapper(
-        minGRU(dim = dim_meta),
-        cache_key = 'prev_hidden',
-        return_cache_key = 'return_next_prev_hidden'
-    ) if use_mingru else dict(depth = 1, attn_dim_head = 32, heads = 8)
+
+    action_proposer_kwargs = dict()
+
+    if use_mingru:
+        action_proposer_kwargs = dict(
+            action_proposer = ActionProposerWrapper(
+                minGRU(dim = dim_meta),
+                cache_key = 'prev_hidden',
+                return_cache_key = 'return_next_prev_hidden'
+            )
+        )
 
     if not use_binary_mapper_variant:
         meta_controller = MetaController(
@@ -78,7 +99,7 @@ def test_metacontroller(
             dim_meta_controller = dim_meta,
             dim_latent = 128,
             switch_per_latent_dim = switch_per_latent_dim,
-            action_proposer = action_proposer
+            **action_proposer_kwargs
         )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
@@ -86,12 +107,12 @@ def test_metacontroller(
             dim_meta_controller = dim_meta,
             switch_per_code = switch_per_latent_dim,
             dim_code_bits = 8,
-            action_proposer = action_proposer
+            **action_proposer_kwargs
         )
 
     # discovery phase
 
-    (action_recon_loss, kl_loss, switch_loss) = model(state, actions, meta_controller = meta_controller, discovery_phase = True, episode_lens = episode_lens)
+    (action_recon_loss, kl_loss, switch_loss) = model(state, actions, condition = condition, meta_controller = meta_controller, discovery_phase = True, episode_lens = episode_lens)
     (action_recon_loss + kl_loss * 0.1 + switch_loss * 0.2).backward()
 
     # internal rl - done iteratively
@@ -115,18 +136,20 @@ def test_metacontroller(
     all_episodes = []
     all_rewards = []
 
+    one_state = state[:1]
+    one_condition = condition[:1] if exists(condition) else None
+
     for _ in range(3): # group of 3
-        subset_state = state[:1]
 
         cache = None
         past_action_id = None
 
         grpo_data_list = []
 
-        for one_state in subset_state.unbind(dim = 1):
-            one_state = rearrange(one_state, 'b d -> b 1 d')
+        for timestep_state in one_state.unbind(dim = 1):
+            timestep_state = rearrange(timestep_state, 'b d -> b 1 d')
 
-            logits, cache = model(one_state, past_action_id, meta_controller = meta_controller, cache = cache, return_cache = True)
+            logits, cache = model(timestep_state, past_action_id, condition = one_condition, meta_controller = meta_controller, cache = cache, return_cache = True)
 
             past_action_id = model.action_readout.sample(logits)
 

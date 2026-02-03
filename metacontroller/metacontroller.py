@@ -206,7 +206,8 @@ class MetaController(Module):
         self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
 
         if isinstance(action_proposer, dict):
-            # default to x-transformers Decoder, wrapped for standard interface
+            # default to Decoder, wrapped for standard interface
+
             action_proposer = ActionProposerWrapper(
                 Decoder(dim = dim_meta, **action_proposer),
                 cache_key = 'cache',
@@ -446,15 +447,26 @@ class Transformer(Module):
         action_embed_readout: dict,
         lower_body: Decoder | dict,
         upper_body: Decoder | dict,
-        meta_controller: MetaController | None = None
+        meta_controller: MetaController | None = None,
+        dim_condition = None
     ):
         super().__init__()
 
+        if exists(dim_condition):
+            transformer_kwargs = dict(
+                dim_condition = dim_condition,
+                use_adaptive_rmsnorm = True
+            )
+        else:
+            transformer_kwargs = dict(
+                use_rmsnorm = True
+            )
+
         if isinstance(lower_body, dict):
-            lower_body = Decoder(dim = dim, pre_norm_has_final_norm = False, **lower_body)
+            lower_body = Decoder(dim = dim, pre_norm_has_final_norm = False, **transformer_kwargs, **lower_body)
 
         if isinstance(upper_body, dict):
-            upper_body = Decoder(dim = dim, **upper_body)
+            upper_body = Decoder(dim = dim, **transformer_kwargs, **upper_body)
 
         self.state_embed, self.state_readout = EmbedAndReadout(dim, **state_embed_readout)
         self.action_embed, self.action_readout = EmbedAndReadout(dim, **action_embed_readout)
@@ -508,7 +520,8 @@ class Transformer(Module):
         return_latents = False,
         return_cache = False,
         episode_lens: Tensor | None = None,
-        return_meta_controller_output = False
+        return_meta_controller_output = False,
+        condition = None
     ):
         device = state.device
 
@@ -568,7 +581,7 @@ class Transformer(Module):
 
             embed = state_embed + action_embed
 
-            residual_stream, next_lower_hiddens = self.lower_body(embed, cache = lower_transformer_hiddens, return_hiddens = True)
+            residual_stream, next_lower_hiddens = self.lower_body(embed, condition = condition, cache = lower_transformer_hiddens, return_hiddens = True)
 
         # meta controller acts on residual stream here
 
@@ -585,7 +598,7 @@ class Transformer(Module):
 
         with upper_transformer_context():
 
-            attended, next_upper_hiddens = self.upper_body(modified_residual_stream, cache = upper_transformer_hiddens, return_hiddens = True)
+            attended, next_upper_hiddens = self.upper_body(modified_residual_stream, condition = condition, cache = upper_transformer_hiddens, return_hiddens = True)
 
             # head readout
 
