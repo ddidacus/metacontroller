@@ -54,6 +54,35 @@ def default(*args):
 def straight_through(src, tgt):
     return tgt + src - src.detach()
 
+# action proposer wrapper
+# normalizes any action proposer to a standard interface for MetaController
+
+class ActionProposerWrapper(Module):
+    def __init__(
+        self,
+        module: Module,
+        cache_key = 'cache',
+        return_cache_key = 'return_hiddens'
+    ):
+        super().__init__()
+        self.module = module
+        self.cache_key = cache_key
+        self.return_cache_key = return_cache_key
+
+    def forward(
+        self,
+        x,
+        cache = None
+    ):
+        kwargs = {self.return_cache_key: True}
+
+        if exists(cache):
+            kwargs[self.cache_key] = cache
+
+        out = self.module(x, **kwargs)
+
+        return out if isinstance(out, tuple) else (out, None)
+
 # losses
 
 BehavioralCloningLosses = namedtuple('BehavioralCloningLosses', (
@@ -155,7 +184,7 @@ class MetaController(Module):
             attn_dim_head = 32,
             heads = 8
         ),
-        action_proposer_kwargs: dict = dict(
+        action_proposer: Module | dict = dict(
             depth = 1,
             attn_dim_head = 32,
             heads = 8
@@ -176,9 +205,15 @@ class MetaController(Module):
         self.emitter = GRU(dim_meta * 2, dim_meta * 2)
         self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
 
-        # internal rl phase substitutes the acausal + emitter with a causal ssm
+        if isinstance(action_proposer, dict):
+            # default to x-transformers Decoder, wrapped for standard interface
+            action_proposer = ActionProposerWrapper(
+                Decoder(dim = dim_meta, **action_proposer),
+                cache_key = 'cache',
+                return_cache_key = 'return_hiddens'
+            )
 
-        self.action_proposer = Decoder(dim = dim_meta, **action_proposer_kwargs)
+        self.action_proposer = action_proposer
         self.action_proposer_mean_log_var = Readout(dim_meta, num_continuous = dim_latent)
 
         # switching unit
@@ -239,7 +274,7 @@ class MetaController(Module):
     ):
         meta_embed = self.model_to_meta(residual_stream)
 
-        proposed_action_hidden = self.action_proposer(meta_embed)
+        proposed_action_hidden, _ = self.action_proposer(meta_embed)
 
         return self.action_proposer_mean_log_var(proposed_action_hidden)
 
@@ -285,7 +320,11 @@ class MetaController(Module):
 
         else: # else internal rl phase
 
-            proposed_action_hidden, next_action_proposer_hidden = self.action_proposer(meta_embed, return_hiddens = True, cache = prev_action_proposer_hidden)
+            proposed_action_hidden, next_action_proposer_hidden = self.action_proposer(
+                meta_embed,
+                cache = prev_action_proposer_hidden
+            )
+
             readout = self.action_proposer_mean_log_var
 
         # sample from the gaussian as the action from the meta controller

@@ -7,8 +7,9 @@ from functools import partial
 
 import torch
 from torch import cat
-from metacontroller.metacontroller import Transformer, MetaController, policy_loss, z_score, extract_grpo_data
+from metacontroller.metacontroller import Transformer, MetaController, ActionProposerWrapper, policy_loss, z_score, extract_grpo_data
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
+from minGRU_pytorch import minGRU
 
 from memmap_replay_buffer import ReplayBuffer
 
@@ -28,11 +29,13 @@ def exists(v):
 ])
 @param('action_discrete', (False, True))
 @param('variable_length', (False, True))
+@param('use_mingru', (False, True))
 def test_metacontroller(
     use_binary_mapper_variant,
     switch_per_latent_dim,
     action_discrete,
-    variable_length
+    variable_length,
+    use_mingru
 ):
 
     state = torch.randn(2, 128, 384)
@@ -62,19 +65,28 @@ def test_metacontroller(
 
     # discovery and internal rl phase with meta controller
 
+    dim_meta = 256
+    action_proposer = ActionProposerWrapper(
+        minGRU(dim = dim_meta),
+        cache_key = 'prev_hidden',
+        return_cache_key = 'return_next_prev_hidden'
+    ) if use_mingru else dict(depth = 1, attn_dim_head = 32, heads = 8)
+
     if not use_binary_mapper_variant:
         meta_controller = MetaController(
             dim_model = 512,
-            dim_meta_controller = 256,
+            dim_meta_controller = dim_meta,
             dim_latent = 128,
-            switch_per_latent_dim = switch_per_latent_dim
+            switch_per_latent_dim = switch_per_latent_dim,
+            action_proposer = action_proposer
         )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
             dim_model = 512,
-            dim_meta_controller = 256,
+            dim_meta_controller = dim_meta,
             switch_per_code = switch_per_latent_dim,
-            dim_code_bits = 8, # 2 ** 8 = 256 codes
+            dim_code_bits = 8,
+            action_proposer = action_proposer
         )
 
     # discovery phase
