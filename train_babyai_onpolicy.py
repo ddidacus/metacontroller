@@ -3,10 +3,11 @@
 #   "fire",
 #   "gymnasium",
 #   "gymnasium[other]",
-#   "metacontroller-pytorch",
+#   "metacontroller-pytorch>=0.0.49",
 #   "minigrid",
 #   "tqdm",
-#   "wandb"
+#   "wandb",
+#   "sentence-transformers"
 # ]
 # ///
 
@@ -16,34 +17,42 @@ from tqdm import tqdm
 
 import numpy as np
 import torch
-from torch import cat, tensor, stack, zeros
+from torch import cat, tensor, stack, Tensor
 from torch.optim import Adam
-from torch.nn.utils.rnn import pad_sequence
 
 from einops import rearrange
 
+from torch_einops_utils import pad_sequence
+
 from accelerate import Accelerator
 
-from babyai_env import create_env
+from babyai_env import create_env, get_mission_embedding
 from metacontroller.metacontroller import Transformer, MetaController, z_score, extract_grpo_data
 from metacontroller.transformer_with_resnet import TransformerWithResnet
 
 # research entry point
 
 def reward_shaping_fn(
-    cumulative_rewards: torch.Tensor,
-    all_rewards: torch.Tensor,
-    episode_lens: torch.Tensor
-) -> torch.Tensor | None:
+    cumulative_rewards: Tensor, # float(num_episodes,)
+    all_rewards: Tensor,        # float(num_episodes, max_timesteps)
+    episode_lens: Tensor,       # int(num_episodes,)
+    reject_threshold_cumulative_reward_variance: float = 0.
+) -> Tensor | None:
     """
     researchers can modify this function to engineer rewards
     or return None to reject the entire batch
-    
-    cumulative_rewards: (num_episodes,)
-    all_rewards: (num_episodes, max_timesteps)
-    episode_lens: (num_episodes,)
     """
+
+    if cumulative_rewards.var() < reject_threshold_cumulative_reward_variance:
+        return None
+
     return cumulative_rewards
+
+def should_reject_group_based_on_switch_betas(
+    switch_betas: Tensor,
+    episode_lens: Tensor
+):
+    return switch_betas.sum().item() == 0.
 
 # helpers
 
@@ -61,18 +70,20 @@ def main(
     num_episodes = int(10e6),
     max_timesteps = 500,
     render_every_eps = 1_000,
-    video_folder = None,
+    video_folder = './recordings',
     seed: int | None = None,
     transformer_weights_path: str | None = None,
     meta_controller_weights_path: str | None = None,
     output_meta_controller_path = 'metacontroller_rl_trained.pt',
     use_resnet = False,
-    lr = 3e-4,
+    lr = 1e-4,
     save_steps = 100,
     num_groups = 16,
     max_grad_norm = 1.0,
     use_wandb = False,
-    wandb_project = 'metacontroller-babyai-rl'
+    wandb_project = 'metacontroller-babyai-rl',
+    reject_threshold_cumulative_reward_variance = 0.1,
+    condition_on_mission_embed = False
 ):
 
     def store_checkpoint(step: int):
@@ -160,9 +171,16 @@ def main(
 
         group_seed = default(seed, random_seed_not_in_skip())
 
-        for _ in range(num_groups):
+        for i in range(num_groups):
 
             state, *_ = env.reset(seed = group_seed)
+
+            if condition_on_mission_embed:
+                mission = env.unwrapped.mission
+                mission_embed = get_mission_embedding(mission)
+                mission_embed = mission_embed.to(accelerator.device)
+                if mission_embed.ndim == 1:
+                    mission_embed = mission_embed.unsqueeze(0)
 
             cache = None
             past_action_id = None
@@ -199,7 +217,8 @@ def main(
                         meta_controller = unwrapped_meta_controller,
                         return_cache = True,
                         return_raw_action_dist = True,
-                        cache = cache
+                        cache = cache,
+                        condition = mission_embed if condition_on_mission_embed else None
                     )
 
                 action = unwrapped_model.action_readout.sample(logits)
@@ -242,51 +261,53 @@ def main(
         # compute advantages via z-score (GRPO style)
 
         cumulative_rewards = stack(all_cumulative_rewards)
-        episode_lens = tensor(all_episode_lens, device=accelerator.device)
+        episode_lens = tensor(all_episode_lens)
+
+        max_len = max(all_episode_lens)
 
         # pad step rewards for reward shaping hook
 
-        max_len = max(all_episode_lens)
-        padded_step_rewards = zeros(num_groups, max_len)
-
-        for i, (rewards, length) in enumerate(zip(all_step_rewards, all_episode_lens)):
-            padded_step_rewards[i, :length] = rewards
+        padded_step_rewards = pad_sequence(all_step_rewards, dim = 0)
 
         # reward shaping hook
 
-        shaped_rewards = reward_shaping_fn(cumulative_rewards, padded_step_rewards, episode_lens)
+        shaped_rewards = reward_shaping_fn(
+            cumulative_rewards,
+            padded_step_rewards,
+            episode_lens,
+            reject_threshold_cumulative_reward_variance = reject_threshold_cumulative_reward_variance
+        )
 
         if not exists(shaped_rewards):
+            accelerator.print(f'group rejected - variance of {cumulative_rewards.var().item():.4f} is lower than threshold of {reject_threshold_cumulative_reward_variance}')
             continue
 
-        # skip if no variance in rewards (z-score would be all zeros)
-        if shaped_rewards.std() < 1e-8:
-            pbar.set_postfix(
-                loss = 'skip (no variance)',
-                reward = f'{cumulative_rewards.mean().item():.4f}'
-            )
-            continue
-
-        group_advantages = z_score(shaped_rewards).to(accelerator.device)  # (num_groups,)
+        group_advantages = z_score(shaped_rewards)
 
         # pad episodes to same length for batching
 
-        padded_states = pad_sequence(all_states, batch_first=True)           # (num_groups, max_len, state_dim)
-        padded_log_probs = pad_sequence(all_log_probs, batch_first=True)     # (num_groups, max_len)
-        padded_switch_betas = pad_sequence(all_switch_betas, batch_first=True)  # (num_groups, max_len)
-        padded_latent_actions = pad_sequence(all_latent_actions, batch_first=True)  # (num_groups, max_len)
+        padded_states, episode_lens = pad_sequence(all_states, dim = 0, return_lens = True)           # (num_groups, max_len, state_dim)
+        padded_log_probs = pad_sequence(all_log_probs, dim = 0)     # (num_groups, max_len)
+        padded_switch_betas = pad_sequence(all_switch_betas, dim = 0)  # (num_groups, max_len)
+        padded_latent_actions = pad_sequence(all_latent_actions, dim = 0)  # (num_groups, max_len)
+
+        # whether to reject group based on switch betas (as it determines the mask for learning)
+
+        if should_reject_group_based_on_switch_betas(padded_switch_betas, episode_lens):
+            accelerator.print(f'group rejected - switch betas for the entire group does not meet criteria for learning')
+            continue
 
         # learn on this group directly (on-policy GRPO)
 
         meta_controller.train()
 
         loss = meta_controller.policy_loss(
-            padded_states,
-            padded_log_probs,
-            padded_latent_actions,
-            group_advantages,
-            padded_switch_betas == 1.,
-            episode_lens = episode_lens
+            padded_states.to(accelerator.device),
+            padded_log_probs.to(accelerator.device),
+            padded_latent_actions.to(accelerator.device),
+            group_advantages.to(accelerator.device),
+            (padded_switch_betas == 1.).to(accelerator.device),
+            episode_lens = episode_lens.to(accelerator.device)
         )
 
         accelerator.backward(loss)

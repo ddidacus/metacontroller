@@ -86,7 +86,6 @@ def main(
     use_resnet = False,
     num_epochs = 3,
     lr = 1e-4,
-    lr = 3e-4,
     save_steps = 100,
     batch_size = 16,
     num_groups = 16,
@@ -183,7 +182,7 @@ def main(
 
     gradient_step = 0
 
-    for gradient_step in pbar:
+    for _ in pbar:
 
         all_episodes = []
         all_cumulative_rewards = []
@@ -346,25 +345,36 @@ def main(
                         episode_lens = batch['_lens']
                     )
 
+                    # gradient acc
+
+                    if gradient_accumulation_steps != None: loss /= gradient_accumulation_steps
+
                     accelerator.backward(loss)
 
-                    grad_norm = accelerator.clip_grad_norm_(meta_controller.parameters(), max_grad_norm)
+                    if gradient_accumulation_steps == None or gradient_step % gradient_accumulation_steps == 0:
 
-                    optim.step()
-                    optim.zero_grad()
+                        grad_norm = accelerator.clip_grad_norm_(meta_controller.parameters(), max_grad_norm)
 
-                    pbar.set_postfix(
-                        epoch = epoch,
-                        loss = f'{loss.item():.4f}',
-                        grad_norm = f'{grad_norm.item():.4f}',
-                        reward = f'{cumulative_rewards.mean().item():.4f}'
-                    )
+                        optim.step()
+                        optim.zero_grad()
 
-                    accelerator.log({
-                        'loss': loss.item(),
-                        'grad_norm': grad_norm.item(),
-                        'reward': cumulative_rewards.mean().item()
-                    })
+                        pbar.set_postfix(
+                            epoch = epoch,
+                            loss = f'{loss.item():.4f}',
+                            grad_norm = f'{grad_norm.item():.4f}',
+                            reward = f'{cumulative_rewards.mean().item():.4f}'
+                        )
+
+                        accelerator.log({
+                            'loss': loss.item(),
+                            'grad_norm': grad_norm.item(),
+                            'reward': cumulative_rewards.mean().item()
+                        })
+
+                    # checkpointing
+                    
+                    if global_step % save_steps == 0:
+                        store_checkpoint(global_step)
 
             meta_controller.eval()
 
