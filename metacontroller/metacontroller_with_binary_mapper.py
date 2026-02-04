@@ -159,6 +159,8 @@ class MetaControllerWithBinaryMapper(Module):
             *self.emitter.parameters(),
             *self.emitter_to_binary_logits.parameters(),
             *self.binary_mapper.parameters(),
+            *self.switching_unit.parameters(),
+            *self.to_switching_unit_beta.parameters(),
             *self.decoder.parameters(),
             *self.switch_gating.parameters()
         ]
@@ -298,11 +300,12 @@ class MetaControllerWithBinaryMapper(Module):
             hard_switch_beta = (switch_beta > 0.5).float()
             switch_beta = straight_through(switch_beta, hard_switch_beta)
 
-        forget = 1. - switch_beta
+        forget_gate = 1. - switch_beta
+        input_gate = switch_beta
 
         # gated codes (or soft distribution)
 
-        gated_codes = self.switch_gating(switch_beta, sampled_codes * forget, prev = prev_switch_gated_hiddens)
+        gated_codes = self.switch_gating(forget_gate, sampled_codes * input_gate, prev = prev_switch_gated_hiddens)
 
         next_switch_gated_codes = gated_codes[:, -1]
 
