@@ -4,7 +4,7 @@
 #   "gymnasium",
 #   "gymnasium[other]",
 #   "metacontroller-pytorch>=0.0.57",
-#   "torch-einops-utils @ git+https://github.com/lucidrains/torch-einops-utils.git",
+#   "torch-einops-utils>=0.0.27",
 #   "minigrid",
 #   "tqdm",
 #   "wandb",
@@ -203,13 +203,6 @@ def main(
 
     for gradient_step in pbar:
 
-        all_states = []
-        all_log_probs = []
-        all_switch_betas = []
-        all_latent_actions = []
-        all_step_rewards = []
-        all_episode_lens = []
-
         # one group of batch_size trajectories per gradient step (for GRPO relative comparison)
         group_seed = get_next_seed()
         env_seeds = [group_seed] * batch_size
@@ -291,24 +284,14 @@ def main(
         cur_latent_actions = torch.cat(iteration_latent_actions, dim = 1)
         cur_rewards = tensor(np.stack(iteration_rewards))  # (timesteps, batch_size)
 
-        all_states.append(cur_states)
-        all_log_probs.append(cur_log_probs)
-        all_switch_betas.append(cur_switch_betas)
-        all_latent_actions.append(cur_latent_actions)
-        all_step_rewards.append(cur_rewards)
-        all_episode_lens.append(episode_lens)
-
         # pack group data (single rollout → one group of batch_size trajectories)
 
-        group_states = pad_sequence_and_cat(all_states, dim = 1, dim_cat = 0)
-        group_log_probs = pad_sequence_and_cat(all_log_probs, dim = 1, dim_cat = 0)
-        group_switch_betas = pad_sequence_and_cat(all_switch_betas, dim = 1, dim_cat = 0)
-        group_latent_actions = pad_sequence_and_cat(all_latent_actions, dim = 1, dim_cat = 0)
+        group_states = cur_states
+        group_log_probs = cur_log_probs
+        group_switch_betas = cur_switch_betas
+        group_latent_actions = cur_latent_actions
         
-        group_step_rewards = pad_sequence_and_cat(all_step_rewards, dim = 0, dim_cat = 1)
-        group_step_rewards = rearrange(group_step_rewards, 't g -> g t')
-
-        episode_lens = cat(all_episode_lens, dim = 0)
+        group_step_rewards = rearrange(cur_rewards, 't g -> g t')
 
         # mask rewards after done
 
@@ -332,10 +315,7 @@ def main(
             accelerator.print(f'group rejected - variance of {cumulative_rewards.var().item():.4f} is lower than threshold of {reject_threshold_cumulative_reward_variance}')
             continue
 
-        grouped_shaped_rewards = rearrange(shaped_rewards, '(g n) -> g n', n = batch_size)
-        grouped_advantages = z_score(grouped_shaped_rewards, dim = 1)
-        group_advantages = rearrange(grouped_advantages, 'g n -> (g n)').float()
-        
+        group_advantages = z_score(shaped_rewards).float()
 
         if torch.any(torch.isnan(group_advantages)):
             accelerator.print(f'group rejected - advantages contained NaNs')
