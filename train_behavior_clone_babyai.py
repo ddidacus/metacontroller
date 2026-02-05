@@ -42,9 +42,6 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
-# TODO: loss is still ~300 and it could be the resnet output?
-# TODO: changelog (paper hparams, checkpointing, difficulty levels in trajectory collection)
-
 def train(
     input_dir = "babyai-minibosslevel-trajectories",
     env_id = "BabyAI-MiniBossLevel-v0",
@@ -64,7 +61,7 @@ def train(
     wandb_project = "metacontroller-babyai-bc",
     checkpoint_path = "transformer_bc.pt",
     meta_controller_checkpoint_path = "meta_controller_discovery.pt",
-    save_steps = 50,
+    save_steps = 1000,
     state_loss_weight = 1.,
     action_loss_weight = 1.,
     discovery_action_recon_loss_weight = 1.,
@@ -190,6 +187,7 @@ def train(
         optim = optim_model if not is_discovering else optim_meta_controller
 
         for batch in progress_bar:
+            
             # batch is a NamedTuple (e.g. MemoryMappedBatch)
             # state: (B, T, 7, 7, 3), action: (B, T)
 
@@ -269,10 +267,13 @@ def train(
             for key, value in log.items():
                 total_losses[key] += value
 
+            if is_discovering: prefix = "discovery_phase"
+            else: prefix = "behavior_cloning"
+
             accelerator.log({
                 **log,
-                "total_loss": loss.item(),
-                "grad_norm": grad_norm.item()
+                f"{prefix}_total_loss": loss.item(),
+                f"{prefix}_grad_norm": grad_norm.item()
             })
 
             progress_bar.set_postfix(**log)

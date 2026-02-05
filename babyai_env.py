@@ -13,22 +13,22 @@ from sentence_transformers import SentenceTransformer
 
 _sbert = None
 
-def get_sbert():
+def get_sbert(local_files_only: bool = False, device: str = "cpu"):
     global _sbert
     if _sbert is None:
-        _sbert = SentenceTransformer('all-MiniLM-L6-v2')
+        _sbert = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=local_files_only, device=device)
     return _sbert
 
 @lru_cache(maxsize = 1000)
-def get_mission_embedding(mission: str):
-    sbert = get_sbert()
+def get_mission_embedding(mission: str, sbert: object = None):
+    if not sbert: sbert = get_sbert()
     embedding = sbert.encode(mission, convert_to_tensor = True)
     return embedding
 
 _mission_cache = {}
 
-def get_missions_embeddings(missions: list[str]):
-    sbert = get_sbert()
+def get_missions_embeddings(missions: list[str], sbert: object = None, batch_size: int = 64):
+    if not sbert: sbert = get_sbert()
     
     # identify uncached missions
     
@@ -36,7 +36,7 @@ def get_missions_embeddings(missions: list[str]):
     uncached_missions = [m for m in unique_missions if m not in _mission_cache]
     
     if len(uncached_missions) > 0:
-        embeddings = sbert.encode(uncached_missions, convert_to_tensor = True)
+        embeddings = sbert.encode(uncached_missions, convert_to_tensor=True, batch_size=batch_size, show_progress_bar=True)
         
         for mission, embedding in zip(uncached_missions, embeddings):
             _mission_cache[mission] = embedding

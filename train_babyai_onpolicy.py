@@ -3,7 +3,6 @@
 #   "fire",
 #   "gymnasium",
 #   "gymnasium[other]",
-#   "memmap-replay-buffer>=0.0.12",
 #   "metacontroller-pytorch>=0.0.49",
 #   "minigrid",
 #   "tqdm",
@@ -14,8 +13,6 @@
 
 from fire import Fire
 from pathlib import Path
-from functools import partial
-from shutil import rmtree
 from tqdm import tqdm
 
 import numpy as np
@@ -30,10 +27,7 @@ from torch_einops_utils import pad_sequence
 from accelerate import Accelerator
 
 from babyai_env import create_env, get_mission_embedding
-
-from memmap_replay_buffer import ReplayBuffer
-
-from metacontroller.metacontroller import Transformer, MetaController, policy_loss, z_score, extract_grpo_data
+from metacontroller.metacontroller import Transformer, MetaController, z_score, extract_grpo_data
 from metacontroller.transformer_with_resnet import TransformerWithResnet
 
 # research entry point
@@ -71,34 +65,29 @@ def default(v, d):
 # main
 
 def main(
+    seed: int | None = None,
     npy_seedfile = None,
     env_name = 'BabyAI-BossLevel-v0',
-    gradient_accumulation_steps = None,
     num_episodes = int(10e6),
     max_timesteps = 500,
-    buffer_size = 1_000,
     render_every_eps = 1_000,
     video_folder = './recordings',
-    seed: int | None = None,
     transformer_weights_path: str | None = None,
     meta_controller_weights_path: str | None = None,
     output_meta_controller_path = 'metacontroller_rl_trained.pt',
     use_resnet = False,
-    num_epochs = 3,
     lr = 1e-4,
     save_steps = 100,
-    batch_size = 16,
     num_groups = 16,
     max_grad_norm = 1.0,
     use_wandb = False,
     wandb_project = 'metacontroller-babyai-rl',
-    reject_threshold_cumulative_reward_variance = 0.,
+    reject_threshold_cumulative_reward_variance = 0.1,
     condition_on_mission_embed = False
 ):
 
-    def store_checkpoint(step:int):
+    def store_checkpoint(step: int):
         if accelerator.is_main_process:
-            # Add step to checkpoint filenames
             meta_controller_checkpoint_path_with_step = output_meta_controller_path.replace('.pt', f'_step_{step}.pt')
             unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
             unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
@@ -170,34 +159,23 @@ def main(
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
 
-    # replay buffer
-
-    replay_buffer = ReplayBuffer(
-        './replay-data',
-        max_episodes = buffer_size,
-        max_timesteps = max_timesteps + 1,
-        fields = unwrapped_meta_controller.replay_buffer_field_dict,
-        meta_fields = dict(advantages = 'float'),
-        overwrite = True,
-        circular = True
-    )
-
     # rollouts
 
     num_batch_updates = num_episodes // num_groups
 
     pbar = tqdm(range(num_batch_updates), desc = 'training')
 
-    gradient_step = 0
+    for gradient_step in pbar:
 
-    for _ in pbar:
-
-        all_episodes = []
+        all_states = []
+        all_log_probs = []
+        all_switch_betas = []
+        all_latent_actions = []
         all_cumulative_rewards = []
         all_step_rewards = []
         all_episode_lens = []
 
-        # every group has a shared seed
+        # every group has a shared seed (for GRPO relative comparison)
 
         group_seed = get_next_seed()
 
@@ -276,27 +254,26 @@ def main(
 
                 state = next_state
 
-            # store episode
+            # store episode data (concatenate timesteps)
+            # each has shape (1, timesteps, ...)
 
-            all_episodes.append((
-                cat(states, dim = 1).squeeze(0),
-                cat(log_probs, dim = 1).squeeze(0),
-                cat(switch_betas, dim = 1).squeeze(0),
-                cat(latent_actions, dim = 1).squeeze(0)
-            ))
+            all_states.append(cat(states, dim=1).squeeze(0))           # (timesteps, state_dim)
+            all_log_probs.append(cat(log_probs, dim=1).squeeze(0))     # (timesteps,)
+            all_switch_betas.append(cat(switch_betas, dim=1).squeeze(0))  # (timesteps,)
+            all_latent_actions.append(cat(latent_actions, dim=1).squeeze(0))  # (timesteps,)
 
             all_cumulative_rewards.append(tensor(total_reward))
             all_step_rewards.append(tensor(step_rewards))
             all_episode_lens.append(episode_len)
 
-        # compute advantages
+        # compute advantages via z-score (GRPO style)
 
         cumulative_rewards = stack(all_cumulative_rewards)
         episode_lens = tensor(all_episode_lens)
 
         max_len = max(all_episode_lens)
 
-        # pad step rewards
+        # pad step rewards for reward shaping hook
 
         padded_step_rewards = pad_sequence(all_step_rewards, dim = 0)
 
@@ -315,78 +292,59 @@ def main(
 
         group_advantages = z_score(shaped_rewards)
 
-        group_states, group_log_probs, group_switch_betas, group_latent_actions = zip(*all_episodes)
+        # pad episodes to same length for batching
+
+        padded_states, episode_lens = pad_sequence(all_states, dim = 0, return_lens = True)           # (num_groups, max_len, state_dim)
+        padded_log_probs = pad_sequence(all_log_probs, dim = 0)     # (num_groups, max_len)
+        padded_switch_betas = pad_sequence(all_switch_betas, dim = 0)  # (num_groups, max_len)
+        padded_latent_actions = pad_sequence(all_latent_actions, dim = 0)  # (num_groups, max_len)
 
         # whether to reject group based on switch betas (as it determines the mask for learning)
 
-        padded_group_switch_betas, episode_lens = pad_sequence(group_switch_betas, dim = 0, return_lens = True)
-
-        if should_reject_group_based_on_switch_betas(padded_group_switch_betas, episode_lens):
+        if should_reject_group_based_on_switch_betas(padded_switch_betas, episode_lens):
             accelerator.print(f'group rejected - switch betas for the entire group does not meet criteria for learning')
             continue
 
-        for states, log_probs, switch_betas, latent_actions, advantages in zip(group_states, group_log_probs, group_switch_betas, group_latent_actions, group_advantages):
-            replay_buffer.store_episode(
-                states = states,
-                log_probs = log_probs,
-                switch_betas = switch_betas,
-                latent_actions = latent_actions,
-                advantages = advantages
-            )
+        # learn on this group directly (on-policy GRPO)
 
-        # learn
+        meta_controller.train()
 
-        if len(replay_buffer) >= buffer_size:
-            dl = replay_buffer.dataloader(batch_size = batch_size, shuffle = True)
-            dl = accelerator.prepare(dl)
+        loss = meta_controller.policy_loss(
+            padded_states.to(accelerator.device),
+            padded_log_probs.to(accelerator.device),
+            padded_latent_actions.to(accelerator.device),
+            group_advantages.to(accelerator.device),
+            (padded_switch_betas == 1.).to(accelerator.device),
+            episode_lens = episode_lens.to(accelerator.device)
+        )
 
-            meta_controller.train()
+        accelerator.backward(loss)
 
-            for epoch in range(num_epochs):
-                for batch in dl:
-                    loss = meta_controller.policy_loss(
-                        batch['states'],
-                        batch['log_probs'],
-                        batch['latent_actions'],
-                        batch['advantages'],
-                        batch['switch_betas'] == 1.,
-                        episode_lens = batch['_lens']
-                    )
+        grad_norm = accelerator.clip_grad_norm_(meta_controller.parameters(), max_grad_norm)
 
-                    # gradient acc
+        optim.step()
+        optim.zero_grad()
 
-                    if gradient_accumulation_steps != None: loss /= gradient_accumulation_steps
+        meta_controller.eval()
 
-                    accelerator.backward(loss)
+        pbar.set_postfix(
+            loss = f'{loss.item():.4f}',
+            grad_norm = f'{grad_norm.item():.4f}',
+            reward = f'{cumulative_rewards.mean().item():.4f}',
+            seed = f'{group_seed}'
+        )
 
-                    if gradient_accumulation_steps == None or gradient_step % gradient_accumulation_steps == 0:
+        accelerator.log({
+            'loss': loss.item(),
+            'grad_norm': grad_norm.item(),
+            'reward': cumulative_rewards.mean().item(),
+            'reward_std': cumulative_rewards.std().item(),
+        })
 
-                        grad_norm = accelerator.clip_grad_norm_(meta_controller.parameters(), max_grad_norm)
+        accelerator.print(f'loss: {loss.item():.4f}, grad_norm: {grad_norm.item():.4f}, reward: {cumulative_rewards.mean().item():.4f}, seed: {group_seed}')
 
-                        optim.step()
-                        optim.zero_grad()
-
-                        pbar.set_postfix(
-                            epoch = epoch,
-                            loss = f'{loss.item():.4f}',
-                            grad_norm = f'{grad_norm.item():.4f}',
-                            reward = f'{cumulative_rewards.mean().item():.4f}'
-                        )
-
-                        accelerator.log({
-                            'loss': loss.item(),
-                            'grad_norm': grad_norm.item(),
-                            'reward': cumulative_rewards.mean().item()
-                        })
-
-                    # checkpointing
-                    
-                    if gradient_step % save_steps == 0:
-                        store_checkpoint(gradient_step)
-
-            meta_controller.eval()
-
-            accelerator.print(f'loss: {loss.item():.4f}, grad_norm: {grad_norm.item():.4f}, reward: {cumulative_rewards.mean().item():.4f}')
+        if gradient_step % save_steps == 0:
+            store_checkpoint(gradient_step)
 
     env.close()
 
