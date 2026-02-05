@@ -104,8 +104,8 @@ class PinPad(GoToSeq):
     def gen_mission(self):
         self.place_agent()
     
-        # Place only the objects specified in obj_indices
-        for idx in self.obj_seq:
+        # Place all objects in the room (not just the ones in the task sequence)
+        for idx in range(self.num_objects):
             obj_type, color = self.object_specs[idx]
             obj = OBJ_CONSTRUCTORS[obj_type](color)
             self.place_in_room(0, 0, obj)
