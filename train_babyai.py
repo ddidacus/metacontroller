@@ -194,7 +194,7 @@ def main(
 
     model, meta_controller, optim = accelerator.prepare(model, meta_controller, optim)
 
-    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model = accelerator.unwrap_model(model) if exists(model) else None
     unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
 
     # replay buffer
@@ -304,7 +304,8 @@ def main(
                 next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
                 next_state['image'] = transform_to_symbolic(next_state['image'])
 
-                iteration_rewards.append(reward)
+                reward_tensor = torch.from_numpy(reward).float().to(accelerator.device)
+                iteration_rewards.append(rearrange(reward_tensor, 'b -> b 1'))
 
                 all_steps_dones.append(dones.clone())
                 dones |= torch.from_numpy(terminated | truncated)
@@ -318,11 +319,11 @@ def main(
 
             episode_lens = (~torch.stack(all_steps_dones)).sum(dim = 0)
 
-            cur_states = torch.cat(iteration_states, dim = 1)
-            cur_log_probs = torch.cat(iteration_log_probs, dim = 1)
-            cur_switch_betas = torch.cat(iteration_switch_betas, dim = 1)
-            cur_latent_actions = torch.cat(iteration_latent_actions, dim = 1)
-            cur_rewards = tensor(np.stack(iteration_rewards)) # (timesteps, num_envs)
+            cur_states = cat(iteration_states, dim = 1)
+            cur_log_probs = cat(iteration_log_probs, dim = 1)
+            cur_switch_betas = cat(iteration_switch_betas, dim = 1)
+            cur_latent_actions = cat(iteration_latent_actions, dim = 1)
+            cur_rewards = cat(iteration_rewards, dim = 1)
 
             # store environment data in batches per iteration
 
@@ -341,7 +342,6 @@ def main(
         group_latent_actions = pad_sequence_and_cat(all_latent_actions, dim = 1, dim_cat = 0)
         
         group_step_rewards = pad_sequence_and_cat(all_step_rewards, dim = 0, dim_cat = 1)
-        group_step_rewards = rearrange(group_step_rewards, 't g -> g t')
 
         episode_lens = cat(all_episode_lens, dim = 0)
         
