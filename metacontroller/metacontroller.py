@@ -261,6 +261,8 @@ class MetaController(Module):
             *self.bidirectional_temporal_encoder.parameters(),
             *self.emitter.parameters(),
             *self.emitter_to_action_mean_log_var.parameters(),
+            *self.switching_unit.parameters(),
+            *self.to_switching_unit_beta.parameters(),
             *self.decoder.parameters(),
             *self.switch_gating.parameters()
         ]
@@ -392,8 +394,10 @@ class MetaController(Module):
             hard_switch_beta = (switch_beta > 0.5).float()
             switch_beta = straight_through(switch_beta, hard_switch_beta)
 
-        forget = 1. - switch_beta
-        gated_action = self.switch_gating(switch_beta, sampled_latent_action * forget, prev = prev_switch_gated_hiddens)
+        forget_gate = 1. - switch_beta
+        input_gate = switch_beta
+
+        gated_action = self.switch_gating(forget_gate, sampled_latent_action * input_gate, prev = prev_switch_gated_hiddens)
 
         next_switch_gated_action = gated_action[:, -1]
 
