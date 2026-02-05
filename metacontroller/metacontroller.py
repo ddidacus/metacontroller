@@ -29,6 +29,7 @@ from discrete_continuous_embed_readout import Embed, Readout, EmbedAndReadout
 from assoc_scan import AssocScan
 
 from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, masked_mean, align_dims_left
+from torch_einops_utils.device import module_device, move_inputs_to_module_device
 from torch_einops_utils.save_load import save_load
 
 # constants
@@ -120,6 +121,7 @@ GRPOOutput = namedtuple('GRPOOutput', (
 def z_score(t, eps = 1e-8):
     return (t - t.mean()) / (t.std() + eps)
 
+@move_inputs_to_module_device
 def policy_loss(
     meta_controller,
     state,
@@ -507,8 +509,8 @@ class Transformer(Module):
         if exists(self.meta_controller): self._ensure_consistent_device(self.meta_controller)
 
     def _ensure_consistent_device(self, network):
-        self.model_device = next(self.parameters()).device
-        if next(network.parameters()).device != self.model_device:
+        self.model_device = module_device(self)
+        if module_device(network) != self.model_device:
             network.to(self.model_device)
 
     def evolve(

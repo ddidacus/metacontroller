@@ -4,7 +4,7 @@
 #   "gymnasium",
 #   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.12",
-#   "metacontroller-pytorch>=0.0.49",
+#   "metacontroller-pytorch>=0.0.56",
 #   "minigrid",
 #   "tqdm",
 #   "wandb",
@@ -25,7 +25,7 @@ from torch.optim import Adam
 
 from einops import rearrange
 
-from torch_einops_utils import pad_sequence
+from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, masked_mean, align_dims_left, pad_sequence, pad_sequence_and_cat
 
 from accelerate import Accelerator
 
@@ -139,8 +139,7 @@ def main(
     # check num_envs
 
     assert divisible_by(num_groups, num_envs), f"num_groups ({num_groups}) must be divisible by num_envs ({num_envs})"
-
-
+    assert num_groups >= 2, "num_groups must be at least 2 for relative comparison (GRPO)"
 
     # accelerator
 
@@ -223,8 +222,10 @@ def main(
 
     for _ in pbar:
 
-        all_episodes = []
-        all_cumulative_rewards = []
+        all_states = []
+        all_log_probs = []
+        all_switch_betas = []
+        all_latent_actions = []
         all_step_rewards = []
         all_episode_lens = []
 
@@ -245,16 +246,15 @@ def main(
             cache = None
             past_action_id = None
 
-            step_states = []
-            step_log_probs = []
-            step_switch_betas = []
-            step_latent_actions = []
-            step_rewards = []
+            iteration_states = []
+            iteration_log_probs = []
+            iteration_switch_betas = []
+            iteration_latent_actions = []
+            iteration_rewards = []
 
             dones = torch.zeros(num_envs, dtype = torch.bool)
 
             all_steps_dones = []
-
 
             # rollout parallel trajectories
 
@@ -290,15 +290,15 @@ def main(
 
                 grpo_data = extract_grpo_data(unwrapped_meta_controller, cache)
 
-                step_states.append(grpo_data.state)
-                step_log_probs.append(grpo_data.log_prob)
-                step_switch_betas.append(grpo_data.switch_beta)
-                step_latent_actions.append(grpo_data.action)
+                iteration_states.append(grpo_data.state)
+                iteration_log_probs.append(grpo_data.log_prob)
+                iteration_switch_betas.append(grpo_data.switch_beta)
+                iteration_latent_actions.append(grpo_data.action)
 
                 next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
                 next_state['image'] = transform_to_symbolic(next_state['image'])
 
-                step_rewards.append(reward)
+                iteration_rewards.append(reward)
 
                 all_steps_dones.append(dones.clone())
                 dones |= torch.from_numpy(terminated | truncated)
@@ -312,46 +312,45 @@ def main(
 
             episode_lens = (~torch.stack(all_steps_dones)).sum(dim = 0)
 
-            states_tensor = torch.cat(step_states, dim = 1)
+            cur_states = torch.cat(iteration_states, dim = 1)
+            cur_log_probs = torch.cat(iteration_log_probs, dim = 1)
+            cur_switch_betas = torch.cat(iteration_switch_betas, dim = 1)
+            cur_latent_actions = torch.cat(iteration_latent_actions, dim = 1)
+            cur_rewards = tensor(np.stack(iteration_rewards)) # (timesteps, num_envs)
 
-            log_probs_tensor = torch.cat(step_log_probs, dim = 1)
-            switch_betas_tensor = torch.cat(step_switch_betas, dim = 1)
-            latent_actions_tensor = torch.cat(step_latent_actions, dim = 1)
+            # store environment data in batches per iteration
 
-            step_rewards_np = np.stack(step_rewards) # (timesteps, num_envs)
+            all_states.append(cur_states)
+            all_log_probs.append(cur_log_probs)
+            all_switch_betas.append(cur_switch_betas)
+            all_latent_actions.append(cur_latent_actions)
+            all_step_rewards.append(cur_rewards)
+            all_episode_lens.append(episode_lens)
 
-            for i in range(num_envs):
-                L = episode_lens[i]
-                
-                all_episodes.append((
-                    states_tensor[i, :L],
-                    log_probs_tensor[i, :L],
-                    switch_betas_tensor[i, :L],
-                    latent_actions_tensor[i, :L]
-                ))
+        # align all sequences across rollout iterations
+ 
+        group_states = pad_sequence_and_cat(all_states, dim = 1, dim_cat = 0)
+        group_log_probs = pad_sequence_and_cat(all_log_probs, dim = 1, dim_cat = 0)
+        group_switch_betas = pad_sequence_and_cat(all_switch_betas, dim = 1, dim_cat = 0)
+        group_latent_actions = pad_sequence_and_cat(all_latent_actions, dim = 1, dim_cat = 0)
+        
+        group_step_rewards = pad_sequence_and_cat(all_step_rewards, dim = 0, dim_cat = 1)
+        group_step_rewards = rearrange(group_step_rewards, 't g -> g t')
 
-                trajectory_rewards = step_rewards_np[:L, i]
-                
-                all_cumulative_rewards.append(tensor(trajectory_rewards.sum()))
-                all_step_rewards.append(tensor(trajectory_rewards))
-                all_episode_lens.append(L)
+        episode_lens = cat(all_episode_lens, dim = 0)
+        
+        # mask rewards after done
 
-        # compute advantages
+        mask = lens_to_mask(episode_lens, group_step_rewards.shape[-1])
+        group_step_rewards = group_step_rewards * mask
 
-        cumulative_rewards = stack(all_cumulative_rewards)
-        episode_lens = tensor(all_episode_lens)
-
-        max_len = max(all_episode_lens)
-
-        # pad step rewards
-
-        padded_step_rewards = pad_sequence(all_step_rewards, dim = 0)
+        cumulative_rewards = group_step_rewards.sum(dim = -1)
 
         # reward shaping hook
 
         shaped_rewards = reward_shaping_fn(
             cumulative_rewards,
-            padded_step_rewards,
+            group_step_rewards,
             episode_lens,
             reject_threshold_cumulative_reward_variance = reject_threshold_cumulative_reward_variance
         )
@@ -362,23 +361,20 @@ def main(
 
         group_advantages = z_score(shaped_rewards).float()
 
-        group_states, group_log_probs, group_switch_betas, group_latent_actions = zip(*all_episodes)
-
         # whether to reject group based on switch betas (as it determines the mask for learning)
 
-        padded_group_switch_betas, episode_lens = pad_sequence(group_switch_betas, dim = 0, return_lens = True)
-
-        if should_reject_group_based_on_switch_betas(padded_group_switch_betas, episode_lens):
+        if should_reject_group_based_on_switch_betas(group_switch_betas, episode_lens):
             accelerator.print(f'group rejected - switch betas for the entire group does not meet criteria for learning')
             continue
 
-        for states, log_probs, switch_betas, latent_actions, advantages in zip(group_states, group_log_probs, group_switch_betas, group_latent_actions, group_advantages):
+        for i in range(num_groups):
+            L = episode_lens[i]
             replay_buffer.store_episode(
-                states = states,
-                log_probs = log_probs,
-                switch_betas = switch_betas,
-                latent_actions = latent_actions,
-                advantages = advantages
+                states = group_states[i, :L],
+                log_probs = group_log_probs[i, :L],
+                switch_betas = group_switch_betas[i, :L],
+                latent_actions = group_latent_actions[i, :L],
+                advantages = group_advantages[i]
             )
 
         # learn

@@ -3,7 +3,7 @@
 #   "fire",
 #   "gymnasium",
 #   "gymnasium[other]",
-#   "metacontroller-pytorch>=0.0.49",
+#   "metacontroller-pytorch>=0.0.56",
 #   "minigrid",
 #   "tqdm",
 #   "x-evolution",
@@ -25,6 +25,7 @@ from einops import rearrange
 
 from babyai_env import create_env, get_mission_embedding
 from metacontroller.metacontroller import Transformer, MetaController
+from torch_einops_utils.device import module_device
 
 # functions
 
@@ -88,7 +89,7 @@ class BabyAIEnvironment(Module):
         )
 
     def forward(self, model):
-        device = next(model.parameters()).device
+        device = module_device(model)
 
         seed = torch.randint(0, int(1e6), ()).item()
         state, _ = self.env.reset(seed = seed)
@@ -178,6 +179,8 @@ def main(
     condition_on_mission_embed = False,
     fitness_fn = default_fitness_fn
 ):
+    assert noise_population_size >= 2, "noise_population_size must be at least 2 for evolutionary strategies"
+
     # load model
 
     assert exists(transformer_weights_path), "Transformer weights must be provided"
