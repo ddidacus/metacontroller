@@ -75,6 +75,10 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
+
 # main
 
 def main(
@@ -100,7 +104,10 @@ def main(
     use_wandb = False,
     wandb_project = 'metacontroller-babyai-rl',
     reject_threshold_cumulative_reward_variance = 0.,
-    condition_on_mission_embed = False
+    condition_on_mission_embed = False,
+    num_envs = 1,
+    env_shared_memory = False,
+    env_context = 'spawn'
 ):
 
     def store_checkpoint(step:int):
@@ -129,6 +136,12 @@ def main(
             return s
         return torch.randint(0, 1000000, (1,)).item()
 
+    # check num_envs
+
+    assert divisible_by(num_groups, num_envs), f"num_groups ({num_groups}) must be divisible by num_envs ({num_envs})"
+
+
+
     # accelerator
 
     accelerator = Accelerator(log_with = 'wandb' if use_wandb else None)
@@ -149,7 +162,9 @@ def main(
         use_symbolic = False
     )
 
-    env = AsyncVectorEnv([env_make_fn], shared_memory = False, context = 'spawn')
+    env = AsyncVectorEnv([env_make_fn] * num_envs, shared_memory = env_shared_memory, context = env_context)
+
+
 
     # load models
 
@@ -199,6 +214,9 @@ def main(
 
     num_batch_updates = num_episodes // num_groups
 
+    num_rollout_iterations = num_groups // num_envs
+
+
     pbar = tqdm(range(num_batch_updates), desc = 'training')
 
     gradient_step = 0
@@ -214,7 +232,7 @@ def main(
 
         group_seed = get_next_seed()
 
-        for i in range(num_groups):
+        for _ in range(num_rollout_iterations):
 
             state, _ = env.reset(seed = group_seed)
             state['image'] = transform_to_symbolic(state['image'])
@@ -227,16 +245,18 @@ def main(
             cache = None
             past_action_id = None
 
-            states = []
-            log_probs = []
-            switch_betas = []
-            latent_actions = []
-
-            total_reward = 0.
+            step_states = []
+            step_log_probs = []
+            step_switch_betas = []
+            step_latent_actions = []
             step_rewards = []
-            episode_len = max_timesteps
 
-            # one episode rollout
+            dones = torch.zeros(num_envs, dtype = torch.bool)
+
+            all_steps_dones = []
+
+
+            # rollout parallel trajectories
 
             for step in range(max_timesteps):
 
@@ -270,36 +290,51 @@ def main(
 
                 grpo_data = extract_grpo_data(unwrapped_meta_controller, cache)
 
-                states.append(grpo_data.state)
-                log_probs.append(grpo_data.log_prob)
-                switch_betas.append(grpo_data.switch_beta)
-                latent_actions.append(grpo_data.action)
+                step_states.append(grpo_data.state)
+                step_log_probs.append(grpo_data.log_prob)
+                step_switch_betas.append(grpo_data.switch_beta)
+                step_latent_actions.append(grpo_data.action)
 
                 next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
                 next_state['image'] = transform_to_symbolic(next_state['image'])
 
-                total_reward += reward[0]
-                step_rewards.append(reward[0])
-                done = terminated[0] or truncated[0]
+                step_rewards.append(reward)
 
-                if done:
-                    episode_len = step + 1
+                all_steps_dones.append(dones.clone())
+                dones |= torch.from_numpy(terminated | truncated)
+
+                if dones.all():
                     break
 
                 state = next_state
 
-            # store episode
+            # post-process for each environment
 
-            all_episodes.append((
-                cat(states, dim = 1).squeeze(0),
-                cat(log_probs, dim = 1).squeeze(0),
-                cat(switch_betas, dim = 1).squeeze(0),
-                cat(latent_actions, dim = 1).squeeze(0)
-            ))
+            episode_lens = (~torch.stack(all_steps_dones)).sum(dim = 0)
 
-            all_cumulative_rewards.append(tensor(total_reward))
-            all_step_rewards.append(tensor(step_rewards))
-            all_episode_lens.append(episode_len)
+            states_tensor = torch.cat(step_states, dim = 1)
+
+            log_probs_tensor = torch.cat(step_log_probs, dim = 1)
+            switch_betas_tensor = torch.cat(step_switch_betas, dim = 1)
+            latent_actions_tensor = torch.cat(step_latent_actions, dim = 1)
+
+            step_rewards_np = np.stack(step_rewards) # (timesteps, num_envs)
+
+            for i in range(num_envs):
+                L = episode_lens[i]
+                
+                all_episodes.append((
+                    states_tensor[i, :L],
+                    log_probs_tensor[i, :L],
+                    switch_betas_tensor[i, :L],
+                    latent_actions_tensor[i, :L]
+                ))
+
+                trajectory_rewards = step_rewards_np[:L, i]
+                
+                all_cumulative_rewards.append(tensor(trajectory_rewards.sum()))
+                all_step_rewards.append(tensor(trajectory_rewards))
+                all_episode_lens.append(L)
 
         # compute advantages
 
