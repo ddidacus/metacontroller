@@ -16,6 +16,8 @@ $ pip install metacontroller-pytorch
 
 - [Diego Calanzone](https://github.com/ddidacus) for proposing testing on BabyAI gridworld task, and submitting the [pull request](https://github.com/lucidrains/metacontroller/pull/3) for behavior cloning and discovery phase training for it!
 
+- [Andrew Song](https://github.com/andrewsonga) for ongoing implementation of the PinPad environment!
+
 ## Usage
 
 ```python
