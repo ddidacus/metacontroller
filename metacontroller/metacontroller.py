@@ -143,6 +143,15 @@ def policy_loss(
     action_dist = meta_controller.get_action_dist_for_internal_rl(state)
     new_log_probs = meta_controller.log_prob(action_dist, actions)
 
+    # maybe sum log probs if not switching per latent dim
+
+    if not meta_controller.switch_per_latent_dim:
+        new_log_probs = reduce(new_log_probs, 'b n d -> b n', 'sum')
+        old_log_probs = reduce(old_log_probs, 'b n d -> b n', 'sum')
+
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            mask = rearrange(mask, 'b n 1 -> b n')
+
     # calculate ratio
 
     ratio = (new_log_probs - old_log_probs).exp()
@@ -185,7 +194,7 @@ class MetaController(Module):
         *,
         dim_meta_controller = 256,
         dim_latent = 128,
-        switch_per_latent_dim = True,
+        switch_per_latent_dim = False,
         decoder_expansion_factor = 2.,
         decoder_depth = 1,
         hypernetwork_low_rank = 16,
