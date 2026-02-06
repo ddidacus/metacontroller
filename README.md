@@ -57,7 +57,7 @@ action_recon_loss, kl_loss = model(
     discovery_phase = True
 )
 
-(action_recon_loss + kl_loss).backward()
+(action_recon_loss + kl_loss * 0.1).backward()
 
 # 4. internal rl phase (GRPO)
 
