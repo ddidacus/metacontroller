@@ -368,9 +368,20 @@ def main(
             accelerator.print(f'group rejected - variance of {cumulative_rewards.var().item():.4f} is lower than threshold of {reject_threshold_cumulative_reward_variance}')
             continue
 
-        grouped_shaped_rewards = rearrange(shaped_rewards, '(g n) -> g n', n = num_groups)
-        grouped_advantages = z_score(grouped_shaped_rewards, dim = 1)
-        group_advantages = rearrange(grouped_advantages, 'g n -> (g n)').float()
+        # gather across GPUs if multi-GPU
+
+        all_shaped_rewards = accelerator.gather(shaped_rewards)
+
+        # compute advantages via z-score (across all gathered rewards)
+
+        all_advantages = z_score(all_shaped_rewards).float()
+
+        # slice back to local process
+
+        process_index = accelerator.process_index
+        num_local_trajectories = shaped_rewards.shape[0]
+
+        group_advantages = all_advantages[process_index * num_local_trajectories: (process_index + 1) * num_local_trajectories]
 
         # whether to reject group based on switch betas (as it determines the mask for learning)
 

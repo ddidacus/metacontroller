@@ -319,7 +319,20 @@ def main(
             accelerator.print(f'group rejected - variance of {cumulative_rewards.var().item():.4f} is lower than threshold of {reject_threshold_cumulative_reward_variance}')
             continue
 
-        group_advantages = z_score(shaped_rewards).float()
+        # gather across GPUs if multi-GPU
+
+        all_shaped_rewards = accelerator.gather(shaped_rewards)
+
+        # compute advantages via z-score (GRPO style)
+
+        all_advantages = z_score(all_shaped_rewards).float()
+
+        # slice back to local process
+
+        process_index = accelerator.process_index
+        num_local_trajectories = shaped_rewards.shape[0]
+
+        group_advantages = all_advantages[process_index * num_local_trajectories: (process_index + 1) * num_local_trajectories]
 
         if torch.any(torch.isnan(group_advantages)):
             accelerator.print(f'group rejected - advantages contained NaNs')
