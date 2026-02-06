@@ -171,6 +171,7 @@ def train(
     discovery_action_recon_loss_weight = 1.,
     discovery_kl_loss_weight = 1.,
     discovery_switch_loss_weight = 1.,
+    target_switch_rate = 0.15,
     max_grad_norm = 1.,
 ):
 
@@ -238,7 +239,7 @@ def train(
 
     # meta controller
 
-    meta_controller = MetaController(dim)
+    meta_controller = MetaController(dim, target_switch_rate = target_switch_rate)
 
     # transformer (no ResNet for one-hot encoded states)
 
