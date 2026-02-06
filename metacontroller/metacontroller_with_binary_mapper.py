@@ -120,10 +120,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         self.switching_unit = GRU(dim_meta + self.num_codes, dim_meta)
 
-        self.to_switching_unit_beta = nn.Linear(dim_meta, 1)
-
-        nn.init.zeros_(self.to_switching_unit_beta.weight)
-        nn.init.constant_(self.to_switching_unit_beta.bias, -3.)
+        self.to_switching_unit_beta = nn.Linear(dim_meta, 1, bias = False)
 
         self.switch_temperature = switch_temperature
 
