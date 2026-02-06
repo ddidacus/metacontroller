@@ -25,7 +25,7 @@ from x_mlps_pytorch import Feedforwards
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, align_dims_left
+from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, align_dims_left, masked_mean
 from torch_einops_utils.save_load import save_load
 
 from vector_quantize_pytorch import BinaryMapper
@@ -65,7 +65,6 @@ class MetaControllerWithBinaryMapper(Module):
         *,
         dim_meta_controller = 256,
         dim_code_bits = 4,
-        switch_per_code = False,
         decoder_expansion_factor = 2.,
         decoder_depth = 1,
         hypernetwork_low_rank = 16,
@@ -78,11 +77,13 @@ class MetaControllerWithBinaryMapper(Module):
             attn_dim_head = 32,
             heads = 8
         ),
-        kl_loss_threshold = 0.
+        kl_loss_threshold = 0.,
+        target_switch_rate = 0.15,
+        switch_temperature = 0.1
     ):
         super().__init__()
         self.dim_model = dim_model
-        assert not switch_per_code, 'switch_per_code is not supported for binary mapper'
+        self.target_switch_rate = target_switch_rate
 
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -119,10 +120,14 @@ class MetaControllerWithBinaryMapper(Module):
 
         # switching unit
 
-        self.switch_per_code = switch_per_code
-
         self.switching_unit = GRU(dim_meta + self.num_codes, dim_meta)
-        self.to_switching_unit_beta = nn.Linear(dim_meta, self.num_codes if switch_per_code else 1, bias = False)
+
+        self.to_switching_unit_beta = nn.Linear(dim_meta, 1)
+
+        nn.init.zeros_(self.to_switching_unit_beta.weight)
+        nn.init.constant_(self.to_switching_unit_beta.bias, -3.)
+
+        self.switch_temperature = switch_temperature
 
         self.switch_gating = AssocScan(**assoc_scan_kwargs)
 
@@ -148,7 +153,7 @@ class MetaControllerWithBinaryMapper(Module):
         return dict(
             states = ('float', self.dim_model),
             log_probs = ('float', self.dim_code_bits),
-            switch_betas = ('float', self.num_codes if self.switch_per_code else 1),
+            switch_betas = 'float',
             latent_actions = ('float', self.num_codes)
         )
 
@@ -274,7 +279,11 @@ class MetaControllerWithBinaryMapper(Module):
             prev_switching_unit_gru_hidden
         )
 
-        switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
+        switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
+
+        switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
+
+        switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
         # losses
 
@@ -283,14 +292,19 @@ class MetaControllerWithBinaryMapper(Module):
         if discovery_phase:
             # weight unreduced kl loss by switch gates
 
-            kl_loss, switch_beta = align_dims_left((kl_loss, switch_beta))
-
-            weighted_kl_loss = kl_loss * switch_beta
+            weighted_kl_loss = einx.multiply('b n ..., b n', kl_loss, switch_beta)
             kl_loss = weighted_kl_loss.sum(dim = -1).mean()
 
-            # encourage less switching
+            # encourage less switching - hinge loss
 
-            switch_loss = switch_beta.mean()
+            mask = None
+
+            if exists(episode_lens):
+                mask = lens_to_mask(episode_lens, seq_len)
+
+            actual_switch_rate = masked_mean(switch_beta, mask, dim = 1)
+
+            switch_loss = F.relu(actual_switch_rate - self.target_switch_rate).mean()
         else:
             kl_loss = self.zero
 
@@ -305,7 +319,9 @@ class MetaControllerWithBinaryMapper(Module):
 
         # gated codes (or soft distribution)
 
-        gated_codes = self.switch_gating(forget_gate, sampled_codes * input_gate, prev = prev_switch_gated_hiddens)
+        gated_sampled_codes = einx.multiply('b n d, b n', sampled_codes, input_gate)
+
+        gated_codes = self.switch_gating(forget_gate, gated_sampled_codes, prev = prev_switch_gated_hiddens)
 
         next_switch_gated_codes = gated_codes[:, -1]
 
@@ -328,11 +344,6 @@ class MetaControllerWithBinaryMapper(Module):
             next_switch_gated_codes,
             sampled_codes[:, -1:]
         )
-
-        # squeeze out the last dimension of switch_beta if single gate for all codes
-
-        if not self.switch_per_code:
-            switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
         return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, switch_loss)
 

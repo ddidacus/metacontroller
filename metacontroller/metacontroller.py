@@ -160,9 +160,14 @@ def policy_loss(
 
     # masking
 
+    if mask.ndim == 3:
+        mask = rearrange(mask, 'b n 1 -> b n')
+
     if exists(episode_lens):
-        mask, episode_mask = align_dims_left((mask, lens_to_mask(episode_lens, losses.shape[1])))
+        episode_mask = lens_to_mask(episode_lens, mask.shape[1])
         mask = mask & episode_mask
+
+    losses = reduce(losses, 'b n d -> b n', 'sum')
 
     return masked_mean(losses, mask)
 
@@ -185,7 +190,6 @@ class MetaController(Module):
         *,
         dim_meta_controller = 256,
         dim_latent = 128,
-        switch_per_latent_dim = True,
         decoder_expansion_factor = 2.,
         decoder_depth = 1,
         hypernetwork_low_rank = 16,
@@ -198,10 +202,14 @@ class MetaController(Module):
             depth = 1,
             attn_dim_head = 32,
             heads = 8
-        )
+        ),
+        target_switch_rate = 0.15,
+        switch_temperature = 0.1
     ):
         super().__init__()
         self.dim_model = dim_model
+        self.target_switch_rate = target_switch_rate
+        
         dim_meta = default(dim_meta_controller, dim_model)
 
         # the linear that brings from model dimension 
@@ -229,11 +237,15 @@ class MetaController(Module):
 
         # switching unit
 
-        self.switch_per_latent_dim = switch_per_latent_dim
-
         self.dim_latent = dim_latent
         self.switching_unit = GRU(dim_meta + dim_latent, dim_meta)
-        self.to_switching_unit_beta = nn.Linear(dim_meta, dim_latent if switch_per_latent_dim else 1, bias = False)
+
+        self.to_switching_unit_beta = nn.Linear(dim_meta, 1)
+
+        nn.init.zeros_(self.to_switching_unit_beta.weight)
+        nn.init.constant_(self.to_switching_unit_beta.bias, -3.)
+
+        self.switch_temperature = switch_temperature
 
         self.switch_gating = AssocScan(**assoc_scan_kwargs)
 
@@ -259,7 +271,7 @@ class MetaController(Module):
         return dict(
             states = ('float', self.dim_model),
             log_probs = ('float', self.dim_latent),
-            switch_betas = ('float', self.dim_latent if self.switch_per_latent_dim else 1),
+            switch_betas = 'float',
             latent_actions = ('float', self.dim_latent)
         )
 
@@ -373,7 +385,11 @@ class MetaController(Module):
             prev_switching_unit_gru_hidden
         )
 
-        switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
+        switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
+
+        switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
+
+        switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
         # need to encourage normal distribution
 
@@ -389,12 +405,19 @@ class MetaController(Module):
                 - 1.
             ))
 
-            kl_loss = kl_loss * switch_beta
+            kl_loss = einx.multiply('b n ..., b n', kl_loss, switch_beta)
             kl_loss = kl_loss.sum(dim = -1).mean()
 
-            # encourage less switching
+            # encourage less switching - hinge loss
 
-            switch_loss = switch_beta.mean()
+            mask = None
+
+            if exists(episode_lens):
+                mask = lens_to_mask(episode_lens, seq_len)
+
+            actual_switch_rate = masked_mean(switch_beta, mask, dim = 1)
+
+            switch_loss = F.relu(actual_switch_rate - self.target_switch_rate).mean()
 
         # maybe hard switch, then use associative scan
 
@@ -405,7 +428,8 @@ class MetaController(Module):
         forget_gate = 1. - switch_beta
         input_gate = switch_beta
 
-        gated_action = self.switch_gating(forget_gate, sampled_latent_action * input_gate, prev = prev_switch_gated_hiddens)
+        gated_sampled_latent_action = einx.multiply('b n d, b n', sampled_latent_action, input_gate)
+        gated_action = self.switch_gating(forget_gate, gated_sampled_latent_action, prev = prev_switch_gated_hiddens)
 
         next_switch_gated_action = gated_action[:, -1]
 
@@ -428,11 +452,6 @@ class MetaController(Module):
             next_switch_gated_action,
             sampled_latent_action[:, -1:]
         )
-
-        # squeeze out the last dimension of switch_beta if single gate for all latent dimensions
-
-        if not self.switch_per_latent_dim:
-            switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
         return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, switch_loss)
 
