@@ -11,6 +11,9 @@
 #   "sentence-transformers"
 # ]
 # ///
+# To train with multiple GPUs:
+# 1. accelerate config
+# 2. accelerate launch train_babyai_onpolicy.py [args]
 
 from fire import Fire
 from pathlib import Path
@@ -277,7 +280,7 @@ def main(
 
             state = next_state
 
-        episode_lens = (~torch.stack(all_steps_dones)).sum(dim = 0)
+        episode_lens = (~torch.stack(all_steps_dones)).sum(dim = 0).to(accelerator.device)
 
         cur_states = cat(iteration_states, dim = 1)
         cur_log_probs = cat(iteration_log_probs, dim = 1)

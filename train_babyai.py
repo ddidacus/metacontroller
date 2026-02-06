@@ -11,6 +11,9 @@
 #   "sentence-transformers"
 # ]
 # ///
+# To train with multiple GPUs:
+# 1. accelerate config
+# 2. accelerate launch train_babyai.py [args]
 
 from fire import Fire
 from pathlib import Path
@@ -343,7 +346,7 @@ def main(
         
         group_step_rewards = pad_sequence_and_cat(all_step_rewards, dim = 0, dim_cat = 1)
 
-        episode_lens = cat(all_episode_lens, dim = 0)
+        episode_lens = cat(all_episode_lens, dim = 0).to(accelerator.device)
         
         # mask rewards after done
 

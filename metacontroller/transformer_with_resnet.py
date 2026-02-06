@@ -176,13 +176,13 @@ def resnet50(num_classes = 1000):
 class TransformerWithResnet(Transformer):
     def __init__(
         self,
-        *,
+        *args,
         resnet_type = 'resnet18',
         is_channel_last = True,
         encoder_kwargs: dict | None = None,
         **kwargs
     ):
-        super().__init__(**kwargs)
+        super().__init__(*args, **kwargs)
         self.is_channel_last = is_channel_last
 
         resnet_klass = resnet18

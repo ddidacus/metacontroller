@@ -8,9 +8,13 @@
 #   "tqdm",
 #   "x-evolution",
 #   "einops",
-#   "sentence-transformers"
+#   "sentence-transformers",
+#   "accelerate"
 # ]
 # ///
+# To train with multiple GPUs:
+# 1. accelerate config
+# 2. accelerate launch train_babyai_evo_strat.py [args]
 
 from __future__ import annotations
 import fire
@@ -26,6 +30,8 @@ from einops import rearrange
 from babyai_env import create_env, get_mission_embedding
 from metacontroller.metacontroller import Transformer, MetaController
 from torch_einops_utils.device import module_device
+
+from accelerate import Accelerator
 
 # functions
 
@@ -61,9 +67,11 @@ class BabyAIEnvironment(Module):
         max_steps = 500,
         use_resnet = False,
         condition_on_mission_embed = False,
-        fitness_fn = default_fitness_fn
+        fitness_fn = default_fitness_fn,
+        accelerator: Accelerator | None = None
     ):
         super().__init__()
+        self.accelerator = accelerator
 
         self.env_id = env_id
         self.video_folder = video_folder
@@ -74,13 +82,6 @@ class BabyAIEnvironment(Module):
         self.fitness_fn = fitness_fn
 
         # initial env creation for observation space etc. if needed
-        # but create_env is called inside pre_main_callback or reset
-        self.env = None
-
-    def pre_main_callback(self):
-        # clean up and initialize environment
-        rmtree(self.video_folder, ignore_errors = True)
-        
         self.env = create_env(
             self.env_id,
             render_mode = 'rgb_array',
@@ -89,6 +90,7 @@ class BabyAIEnvironment(Module):
         )
 
     def forward(self, model):
+
         device = module_device(model)
 
         seed = torch.randint(0, int(1e6), ()).item()
@@ -105,7 +107,13 @@ class BabyAIEnvironment(Module):
         cache = None
         past_action_id = None
 
-        unwrapped_model = getattr(model, 'model', model)
+        # correctly unwrap model to access visual_encode
+        unwrapped_model = model
+        if exists(self.accelerator):
+            unwrapped_model = self.accelerator.unwrap_model(model)
+        
+        # also handle Noisable wrapper attribute blocking from x-evolution
+        unwrapped_model = getattr(unwrapped_model, 'model', unwrapped_model)
 
         episode_rewards = []
         episode_states = []
@@ -179,6 +187,11 @@ def main(
     condition_on_mission_embed = False,
     fitness_fn = default_fitness_fn
 ):
+    accelerator = Accelerator()
+
+    if accelerator.is_main_process:
+        rmtree(video_folder, ignore_errors = True)
+
     assert noise_population_size >= 2, "noise_population_size must be at least 2 for evolutionary strategies"
 
     # load model
@@ -207,7 +220,8 @@ def main(
         max_steps = max_steps,
         use_resnet = use_resnet,
         condition_on_mission_embed = condition_on_mission_embed,
-        fitness_fn = fitness_fn
+        fitness_fn = fitness_fn,
+        accelerator = accelerator
     )
 
     # evolve
@@ -217,13 +231,15 @@ def main(
         environment = babyai_env,
         noise_population_size = noise_population_size,
         noise_scale = noise_scale,
-        learning_rate = learning_rate
+        learning_rate = learning_rate,
+        accelerator = accelerator
     )
 
     # save
 
-    model.meta_controller.save(output_meta_controller_path)
-    print(f'MetaController weights saved to {output_meta_controller_path}')
+    if accelerator.is_main_process:
+        model.meta_controller.save(output_meta_controller_path)
+        print(f'MetaController weights saved to {output_meta_controller_path}')
 
 if __name__ == '__main__':
     fire.Fire(main)
