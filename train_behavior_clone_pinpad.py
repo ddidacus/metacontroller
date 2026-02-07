@@ -169,8 +169,7 @@ def train(
     state_loss_weight = 1.,
     action_loss_weight = 1.,
     discovery_action_recon_loss_weight = 1.,
-    discovery_kl_loss_weight = 1.,
-    discovery_switch_loss_weight = 1.,
+    discovery_kl_loss_weight = 0.15,
     max_grad_norm = 1.,
 ):
 
@@ -298,18 +297,16 @@ def train(
                 )
 
                 if is_discovering:
-                    action_recon_loss, kl_loss, switch_loss = losses
+                    action_recon_loss, kl_loss = losses
 
                     loss = (
                         action_recon_loss * discovery_action_recon_loss_weight +
-                        kl_loss * discovery_kl_loss_weight +
-                        switch_loss * discovery_switch_loss_weight
+                        kl_loss * discovery_kl_loss_weight
                     )
 
                     log = dict(
                         action_recon_loss = action_recon_loss.item(),
                         kl_loss = kl_loss.item(),
-                        switch_loss = switch_loss.item(),
                         switch_density = meta_controller_output.switch_beta.mean().item()
                     )
 

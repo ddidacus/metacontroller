@@ -25,7 +25,7 @@ from x_mlps_pytorch import Feedforwards
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, align_dims_left
+from torch_einops_utils import maybe, pad_at_dim, lens_to_mask, align_dims_left, masked_mean
 from torch_einops_utils.save_load import save_load
 
 from vector_quantize_pytorch import BinaryMapper
@@ -78,7 +78,7 @@ class MetaControllerWithBinaryMapper(Module):
             heads = 8
         ),
         kl_loss_threshold = 0.,
-        reduce_policy_loss: bool | None = None
+        switch_temperature = 0.1
     ):
         super().__init__()
         self.dim_model = dim_model
@@ -119,7 +119,10 @@ class MetaControllerWithBinaryMapper(Module):
         # switching unit
 
         self.switching_unit = GRU(dim_meta + self.num_codes, dim_meta)
+
         self.to_switching_unit_beta = nn.Linear(dim_meta, 1, bias = False)
+
+        self.switch_temperature = switch_temperature
 
         self.switch_gating = AssocScan(**assoc_scan_kwargs)
 
@@ -145,7 +148,7 @@ class MetaControllerWithBinaryMapper(Module):
         return dict(
             states = ('float', self.dim_model),
             log_probs = ('float', self.dim_code_bits),
-            switch_betas = ('float', 1),
+            switch_betas = 'float',
             latent_actions = ('float', self.num_codes)
         )
 
@@ -221,6 +224,10 @@ class MetaControllerWithBinaryMapper(Module):
         hard_switch = default(hard_switch, not discovery_phase) # think during internal RL phase, it needs to be a hard switch, then only the actions emitted during the switch is reinforced
 
         if discovery_phase:
+
+            if exists(prev_action_proposer_hidden):
+                logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
+
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
 
             encoded_temporal = self.bidirectional_temporal_encoder(meta_embed, mask = mask)
@@ -271,17 +278,19 @@ class MetaControllerWithBinaryMapper(Module):
             prev_switching_unit_gru_hidden
         )
 
-        switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
+        switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
+
+        switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
+
+        switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
         # losses
 
         if discovery_phase:
             # weight unreduced kl loss by switch gates
 
-            kl_loss, switch_beta = align_dims_left((kl_loss, switch_beta))
+            kl_loss = kl_loss.sum(dim = -1).mean()
 
-            weighted_kl_loss = kl_loss * switch_beta
-            kl_loss = weighted_kl_loss.sum(dim = -1).mean()
         else:
             kl_loss = self.zero
 
@@ -296,7 +305,9 @@ class MetaControllerWithBinaryMapper(Module):
 
         # gated codes (or soft distribution)
 
-        gated_codes = self.switch_gating(forget_gate, sampled_codes * input_gate, prev = prev_switch_gated_hiddens)
+        gated_sampled_codes = einx.multiply('b n d, b n', sampled_codes, input_gate)
+
+        gated_codes = self.switch_gating(forget_gate, gated_sampled_codes, prev = prev_switch_gated_hiddens)
 
         next_switch_gated_codes = gated_codes[:, -1]
 
@@ -319,10 +330,6 @@ class MetaControllerWithBinaryMapper(Module):
             next_switch_gated_codes,
             sampled_codes[:, -1:]
         )
-
-        # squeeze out the last dimension of switch_beta
-
-        switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
         return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss)
 
