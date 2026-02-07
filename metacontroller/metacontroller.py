@@ -202,7 +202,8 @@ class MetaController(Module):
             attn_dim_head = 32,
             heads = 8
         ),
-        switch_temperature = 0.5,
+        #switch_temperature = 0.5,
+        switch_temperature = 1.0,
         hard_switch = None
     ):
         super().__init__()
