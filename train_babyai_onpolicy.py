@@ -62,8 +62,9 @@ def reward_shaping_fn(
     or return None to reject the entire batch
     """
 
-    if cumulative_rewards.var() < reject_threshold_cumulative_reward_variance:
-        return None
+    if exists(reject_threshold_cumulative_reward_variance):
+        if cumulative_rewards.var() < reject_threshold_cumulative_reward_variance:
+            return None
 
     return cumulative_rewards
 
@@ -102,14 +103,16 @@ def main(
     lr = 3e-5,
     save_steps = 100,
     batch_size = 16,
-    max_grad_norm = 1.0,
+    max_grad_norm = None,
     use_wandb = False,
     wandb_project = 'metacontroller-babyai-rl',
-    reject_threshold_cumulative_reward_variance = 0.1,
+    reject_threshold_cumulative_reward_variance = None,
     condition_on_mission_embed = False,
     env_shared_memory = True,
     env_context = 'fork'
 ):
+
+    if not exists(max_grad_norm): max_grad_norm = float('inf')
 
     def store_checkpoint(step: int):
         if accelerator.is_main_process:
@@ -168,11 +171,8 @@ def main(
     if exists(transformer_weights_path):
         weights_path = Path(transformer_weights_path)
         assert weights_path.exists(), f"transformer weights not found at {weights_path}"
-        
         transformer_klass = TransformerWithResnet if use_resnet else Transformer
-
         model = transformer_klass.init_and_load(str(weights_path), strict = False)
-        
         model.eval()
 
     meta_controller = None
@@ -353,7 +353,7 @@ def main(
             group_log_probs,
             group_latent_actions,
             group_advantages,
-            group_switch_betas == 1.,
+            group_switch_betas,
             episode_lens = episode_lens
         )
 
@@ -378,6 +378,7 @@ def main(
             'grad_norm': grad_norm.item(),
             'reward': cumulative_rewards.mean().item(),
             'reward_std': cumulative_rewards.std().item(),
+            'switch_density': group_switch_betas.mean().item()
         })
 
         accelerator.print(f'loss: {loss.item():.4f}, grad_norm: {grad_norm.item():.4f}, reward: {cumulative_rewards.mean().item():.4f}, seeds: {group_seeds}')

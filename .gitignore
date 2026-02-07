@@ -3,6 +3,7 @@ recordings/
 trajectories/
 wandb/
 checkpoints/
+notebooks/
 *.sh
 *.out
 *.slurm
