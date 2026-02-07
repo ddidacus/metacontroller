@@ -275,8 +275,6 @@ class MetaControllerWithBinaryMapper(Module):
 
         # losses
 
-        switch_loss = self.zero
-
         if discovery_phase:
             # weight unreduced kl loss by switch gates
 
@@ -284,10 +282,6 @@ class MetaControllerWithBinaryMapper(Module):
 
             weighted_kl_loss = kl_loss * switch_beta
             kl_loss = weighted_kl_loss.sum(dim = -1).mean()
-
-            # encourage less switching
-
-            switch_loss = switch_beta.mean()
         else:
             kl_loss = self.zero
 
@@ -330,6 +324,6 @@ class MetaControllerWithBinaryMapper(Module):
 
         switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
-        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss, switch_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, binary_logits, sampled_codes, switch_beta, kl_loss)
 
 MetaControllerWithBinaryMapper.policy_loss = policy_loss

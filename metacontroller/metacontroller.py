@@ -54,9 +54,6 @@ def default(*args):
 
 # tensor helpers
 
-def straight_through(src, tgt):
-    return tgt + src - src.detach()
-
 # action proposer wrapper
 # normalizes any action proposer to a standard interface for MetaController
 
@@ -94,9 +91,9 @@ BehavioralCloningLosses = namedtuple('BehavioralCloningLosses', (
 ))
 
 DiscoveryLosses = namedtuple('DiscoveryLosses', (
+    'state_pred',
     'action_recon',
-    'kl',
-    'switch'
+    'kl'
 ))
 
 # meta controller
@@ -107,8 +104,7 @@ MetaControllerOutput = namedtuple('MetaControllerOutput', (
     'action_dist',
     'actions',
     'switch_beta',
-    'kl_loss',
-    'switch_loss'
+    'kl_loss'
 ))
 
 GRPOOutput = namedtuple('GRPOOutput', (
@@ -236,6 +232,7 @@ class MetaController(Module):
         self.dim_latent = dim_latent
         self.switching_unit = GRU(dim_meta + dim_latent, dim_meta)
         self.to_switching_unit_beta = nn.Linear(dim_meta, 1, bias = False)
+        nn.init.zeros_(self.to_switching_unit_beta.weight)
 
         self.switch_gating = AssocScan(**assoc_scan_kwargs)
 
@@ -277,6 +274,22 @@ class MetaController(Module):
             *self.switch_gating.parameters()
         ]
 
+    def discovery_parameters_switching_unit(self):
+        return [
+            *self.switching_unit.parameters(),
+            *self.to_switching_unit_beta.parameters(),
+        ]
+
+    def discovery_parameters_non_switching(self):
+        return [
+            *self.model_to_meta.parameters(),
+            *self.bidirectional_temporal_encoder.parameters(),
+            *self.emitter.parameters(),
+            *self.emitter_to_action_mean_log_var.parameters(),
+            *self.decoder.parameters(),
+            *self.switch_gating.parameters()
+        ]
+
     def internal_rl_parameters(self):
         return [
             *self.action_proposer.parameters(),
@@ -305,8 +318,8 @@ class MetaController(Module):
         residual_stream,
         cache: MetaControllerOutput | None = None,
         discovery_phase = False,
-        hard_switch = None,
         temperature = 1.,
+        sigmoid_temperature = 0.5,
         episode_lens: Tensor | None = None
     ):
         device = residual_stream.device
@@ -321,10 +334,9 @@ class MetaController(Module):
 
         meta_embed = self.model_to_meta(residual_stream)
 
-        hard_switch = default(hard_switch, not discovery_phase) # think during internal RL phase, it needs to be a hard switch, then only the actions emitted during the switch is reinforced
-
         if discovery_phase:
-            logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
+            if exists(cache):
+                logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
 
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
 
@@ -375,11 +387,12 @@ class MetaController(Module):
             prev_switching_unit_gru_hidden
         )
 
-        switch_beta = self.to_switching_unit_beta(switching_unit_gru_out).sigmoid()
+        switch_beta = self.to_switching_unit_beta(switching_unit_gru_out)
+        switch_beta = torch.sigmoid(switch_beta / sigmoid_temperature)
 
         # need to encourage normal distribution
 
-        kl_loss = switch_loss = self.zero
+        kl_loss = self.zero
 
         if discovery_phase:
             mean, log_var = action_dist.unbind(dim = -1)
@@ -391,18 +404,10 @@ class MetaController(Module):
                 - 1.
             ))
 
-            kl_loss = kl_loss * switch_beta
+            kl_loss = kl_loss
             kl_loss = kl_loss.sum(dim = -1).mean()
 
-            # encourage less switching
-
-            switch_loss = switch_beta.mean()
-
         # maybe hard switch, then use associative scan
-
-        if hard_switch:
-            hard_switch_beta = (switch_beta > 0.5).float()
-            switch_beta = straight_through(switch_beta, hard_switch_beta)
 
         forget_gate = 1. - switch_beta
         input_gate = switch_beta
@@ -435,7 +440,7 @@ class MetaController(Module):
 
         switch_beta = rearrange(switch_beta, '... 1 -> ...')
 
-        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss, switch_loss)
+        return control_signal, MetaControllerOutput(next_hiddens, residual_stream, action_dist, sampled_latent_action, switch_beta, kl_loss)
 
 MetaController.policy_loss = policy_loss
 
@@ -636,7 +641,8 @@ class Transformer(Module):
         with meta_controller_context():
 
             if exists(meta_controller) and not behavioral_cloning:
-                control_signal, next_meta_hiddens = meta_controller(residual_stream, cache = meta_hiddens, discovery_phase = discovery_phase, temperature = meta_controller_temperature, episode_lens = episode_lens)
+                meta_cache = None if discovery_phase else meta_hiddens
+                control_signal, next_meta_hiddens = meta_controller(residual_stream, cache = meta_cache, discovery_phase = discovery_phase, temperature = meta_controller_temperature, episode_lens = episode_lens)
             else:
                 control_signal, next_meta_hiddens = self.zero, None
 
@@ -664,9 +670,11 @@ class Transformer(Module):
 
             loss_mask = maybe(lens_to_mask)(episode_lens, state.shape[1])
 
+            # state
             state_dist_params = self.state_readout(attended)
             state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = loss_mask)
 
+            # action
             action_clone_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = loss_mask)
 
             losses = BehavioralCloningLosses(state_clone_loss, action_clone_loss)
@@ -678,9 +686,15 @@ class Transformer(Module):
 
         elif discovery_phase:
 
+            # state 
+            loss_mask = maybe(lens_to_mask)(episode_lens, state.shape[1])
+            state_dist_params = self.state_readout(attended)
+            state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = loss_mask)
+
+            # action
             action_recon_loss = self.action_readout.calculate_loss(dist_params, target_actions)
 
-            losses = DiscoveryLosses(action_recon_loss, next_meta_hiddens.kl_loss, next_meta_hiddens.switch_loss)
+            losses = DiscoveryLosses(state_clone_loss, action_recon_loss, next_meta_hiddens.kl_loss)
 
             if not return_meta_controller_output:
                 return losses
