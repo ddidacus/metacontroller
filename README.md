@@ -18,6 +18,8 @@ $ pip install metacontroller-pytorch
 
 - [Andrew Song](https://github.com/andrewsonga) for ongoing implementation of the PinPad environment!
 
+- [Diego Calanzone](https://github.com/ddidacus) for his experimental acumen, bringing the project to an initial [working state](https://github.com/lucidrains/metacontroller/pull/13) for the BabyAI environment!
+
 ## Usage
 
 ```python
@@ -50,14 +52,16 @@ meta_controller = MetaController(
     dim_latent = 128
 )
 
-action_recon_loss, kl_loss = model(
+state_pred_loss, action_recon_loss, kl_loss = model(
     state,
     actions,
     meta_controller = meta_controller,
     discovery_phase = True
 )
 
-(action_recon_loss + kl_loss).backward()
+# they did not use state pred loss in the paper (weight set to 0, but available)
+
+(action_recon_loss + kl_loss * 0.1).backward()
 
 # 4. internal rl phase (GRPO)
 

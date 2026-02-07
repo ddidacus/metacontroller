@@ -78,10 +78,12 @@ class MetaControllerWithBinaryMapper(Module):
             heads = 8
         ),
         kl_loss_threshold = 0.,
-        switch_temperature = 0.1
+        switch_temperature = 0.1,
+        hard_switch = None
     ):
         super().__init__()
         self.dim_model = dim_model
+        self.hard_switch = hard_switch
 
         dim_meta = default(dim_meta_controller, dim_model)
 
@@ -120,10 +122,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         self.switching_unit = GRU(dim_meta + self.num_codes, dim_meta)
 
-        self.to_switching_unit_beta = nn.Linear(dim_meta, 1)
-
-        nn.init.zeros_(self.to_switching_unit_beta.weight)
-        nn.init.constant_(self.to_switching_unit_beta.bias, -3.)
+        self.to_switching_unit_beta = nn.Linear(dim_meta, 1, bias = False)
 
         self.switch_temperature = switch_temperature
 
@@ -224,9 +223,13 @@ class MetaControllerWithBinaryMapper(Module):
 
         meta_embed = self.model_to_meta(residual_stream)
 
-        hard_switch = default(hard_switch, not discovery_phase) # think during internal RL phase, it needs to be a hard switch, then only the actions emitted during the switch is reinforced
+        hard_switch = default(hard_switch, self.hard_switch, not discovery_phase) # think during internal RL phase, it needs to be a hard switch, then only the actions emitted during the switch is reinforced
 
         if discovery_phase:
+
+            if exists(prev_action_proposer_hidden):
+                logger.warning('meta controller cache being passed back in for discovery phase, which does not make sense given bidirectional encoder')
+
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
 
             encoded_temporal = self.bidirectional_temporal_encoder(meta_embed, mask = mask)

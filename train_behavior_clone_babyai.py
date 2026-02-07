@@ -41,6 +41,22 @@ import gymnasium as gym
 
 # helpers
 
+from torch.nn import init
+import torch.nn as nn
+
+def initialize_weights_xavier(module):
+    if isinstance(module, nn.Linear):
+        # Apply Xavier uniform initialization to weights
+        init.xavier_uniform_(module.weight)
+        # Initialize biases to zero if they exist
+        if module.bias is not None:
+            init.zeros_(module.bias)
+    elif isinstance(module, nn.Conv2d):
+        # Apply Xavier uniform initialization to convolutional layers
+        init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            init.zeros_(module.bias)
+
 def exists(v):
     return v is not None
 
@@ -118,18 +134,23 @@ def train(
     wandb_project = "metacontroller-babyai-bc",
     checkpoint_path = "transformer_bc.pt",
     meta_controller_checkpoint_path = "meta_controller_discovery.pt",
+    load_transformer_weights_path = None,
+    load_meta_controller_weights_path = None,
     save_steps = 1000,
     state_loss_weight = 1.,
     action_loss_weight = 1.,
     discovery_action_recon_loss_weight = 1.,
-    discovery_kl_loss_weight = 0.15,
+    discovery_kl_loss_weight = 0.05,
+    discovery_switch_warmup_steps = 1,
+    discovery_switch_lr_scale = 0.1,
+    discovery_obs_loss_weight = 0.0,
     max_grad_norm = 1.,
     use_resnet = False,
     condition_on_mission_embed = False,
     mission_embed_dim = 384
 ):
 
-    def store_checkpoint(step:int | None = None):
+    def store_checkpoint(step:int = None, is_discovering: bool = False):
         if accelerator.is_main_process:
 
             if exists(step):
@@ -140,11 +161,13 @@ def train(
                 checkpoint_path_with_step = checkpoint_path
                 meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path
 
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save(checkpoint_path_with_step)
+            if not is_discovering:
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.save(checkpoint_path_with_step)
 
-            unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
-            unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
+            if is_discovering:
+                unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
+                unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
 
             accelerator.print(f"Model saved to {checkpoint_path_with_step}, MetaController to {meta_controller_checkpoint_path_with_step}")
 
@@ -214,11 +237,44 @@ def train(
 
     model = transformer_class(**transformer_kwargs)
 
+    # load pre-trained weights for fine-tuning if given / otherwise xavier init
+    
+    if exists(load_transformer_weights_path):
+        _path = Path(load_transformer_weights_path)
+        assert _path.exists(), f"load_transformer_weights_path {load_transformer_weights_path} does not exist"
+        if hasattr(model, "load"):
+            model.load(str(_path))
+        else:
+            state = torch.load(_path, map_location="cpu", weights_only=True)
+            model.load_state_dict(state, strict=False)
+        accelerator.print(f"Loaded transformer weights from {load_transformer_weights_path}")
+    else:
+        for name, child in model.named_children():
+            if name != "meta_controller":
+                child.apply(initialize_weights_xavier)
+        accelerator.print("Initialized transformer with Xavier")
+
+    if exists(load_meta_controller_weights_path):
+        _path = Path(load_meta_controller_weights_path)
+        assert _path.exists(), f"load_meta_controller_weights_path {load_meta_controller_weights_path} does not exist"
+        if hasattr(meta_controller, "load"):
+            meta_controller.load(str(_path))
+        else:
+            state = torch.load(_path, map_location="cpu", weights_only=True)
+            meta_controller.load_state_dict(state, strict=False)
+        accelerator.print(f"Loaded meta_controller weights from {load_meta_controller_weights_path}")
+    else:
+        meta_controller.apply(initialize_weights_xavier)
+        accelerator.print("Initialized meta_controller with Xavier")
+
     # optimizer
 
     optim_model = AdamW(model.parameters(), lr = lr, weight_decay = weight_decay)
 
-    optim_meta_controller = AdamW(meta_controller.discovery_parameters(), lr = discovery_lr, weight_decay = discovery_weight_decay)
+    optim_meta_controller = AdamW([
+        {"params": meta_controller.discovery_parameters_non_switching(), "lr": discovery_lr},
+        {"params": meta_controller.discovery_parameters_switching_unit(), "lr": 0.0},
+    ], weight_decay = discovery_weight_decay)
 
     # prepare
 
@@ -274,17 +330,25 @@ def train(
                 )
 
                 if is_discovering:
-                    action_recon_loss, kl_loss = losses
+                    obs_loss, action_recon_loss, kl_loss = losses
 
                     loss = (
+                        obs_loss * discovery_obs_loss_weight + 
                         action_recon_loss * discovery_action_recon_loss_weight +
                         kl_loss * discovery_kl_loss_weight
                     )
 
+                    # LR warmup + permanent scale for switching unit: ramp to discovery_lr * scale over warmup, then stay there
+                    warmup_factor = min(1.0, (gradient_step + 1) / discovery_switch_warmup_steps)
+                    switch_lr = discovery_lr * discovery_switch_lr_scale * warmup_factor
+                    optim_meta_controller.param_groups[1]["lr"] = switch_lr
+
                     log = dict(
+                        obs_loss = obs_loss.item(),
                         action_recon_loss = action_recon_loss.item(),
                         kl_loss = kl_loss.item(),
-                        switch_density = meta_controller_output.switch_beta.mean().item()
+                        switch_density = meta_controller_output.switch_beta.mean().item(),
+                        switch_lr_warmup = warmup_factor,
                     )
                 else:
                     state_loss, action_loss = losses
@@ -334,7 +398,7 @@ def train(
 
             if gradient_step % save_steps == 0:
                 accelerator.wait_for_everyone()
-                store_checkpoint(gradient_step)
+                store_checkpoint(gradient_step, is_discovering)
 
                 # visualize switch betas during discovery phase
                 if is_discovering and use_wandb and accelerator.is_main_process:
@@ -351,7 +415,7 @@ def train(
 
     # save weights
     accelerator.wait_for_everyone()
-    store_checkpoint()
+    store_checkpoint(None, is_discovering)
 
     accelerator.end_training()
 
