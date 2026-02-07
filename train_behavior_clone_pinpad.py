@@ -21,6 +21,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.optim import AdamW
+from torch.nn import init
+import torch.nn as nn
 
 from accelerate import Accelerator
 from memmap_replay_buffer import ReplayBuffer
@@ -30,16 +32,28 @@ import matplotlib.pyplot as plt
 import wandb
 
 from metacontroller import MetaController, Transformer
+from metacontroller.transformer_with_resnet import TransformerWithResnet
 
 import gymnasium as gym
 from gymnasium.envs.registration import register
 
 # Import PinPad environment classes from gather_pinpad_trajs.py
+from minigrid.wrappers import FullyObsWrapper
 from gather_pinpad_trajs import PinPad, OneHotFullyObsWrapper
 
 # ============================================================================
 # Helpers
 # ============================================================================
+
+def initialize_weights_xavier(module):
+    if isinstance(module, nn.Linear):
+        init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            init.zeros_(module.bias)
+    elif isinstance(module, nn.Conv2d):
+        init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            init.zeros_(module.bias)
 
 def exists(v):
     return v is not None
@@ -65,7 +79,8 @@ def create_pinpad_env(env_id, num_objects, obj_seq, room_size, num_rows, num_col
     )
     
     env = gym.make(env_id, obj_seq=obj_seq)
-    env = OneHotFullyObsWrapper(env)
+    #env = OneHotFullyObsWrapper(env)
+    env = FullyObsWrapper(env)
     return env
 
 
@@ -143,7 +158,7 @@ def train(
     cloning_epochs = 10,
     discovery_epochs = 10,
     batch_size = 128,
-    gradient_accumulation_steps = None, 
+    gradient_accumulation_steps = None,
     lr = 1e-4,
     discovery_lr = 1e-4,
     weight_decay = 0.03,
@@ -152,20 +167,28 @@ def train(
     depth = 2,
     heads = 8,
     dim_head = 64,
+    switch_temperature = 1.,
     use_wandb = False,
     wandb_project = "metacontroller-pinpad-bc",
     wandb_run_name = None,
     checkpoint_path = "transformer_pinpad_bc.pt",
     meta_controller_checkpoint_path = "meta_controller_pinpad_discovery.pt",
+    load_transformer_weights_path = None,
+    load_meta_controller_weights_path = None,
     save_steps = 1000,
     state_loss_weight = 1.,
     action_loss_weight = 1.,
     discovery_action_recon_loss_weight = 1.,
     discovery_kl_loss_weight = 0.15,
+    discovery_switch_warmup_steps = 1,
+    discovery_switch_lr_scale = 0.1,
+    discovery_obs_loss_weight = 0.0,
     max_grad_norm = 1.,
+    use_resnet = False,
+    condition_on_mission_embed = False,
+    mission_embed_dim = 384
 ):
-
-    def store_checkpoint(step: int | None = None):
+    def store_checkpoint(step: int | None = None, is_discovering: bool = False):
         if accelerator.is_main_process:
             if exists(step):
                 checkpoint_path_with_step = checkpoint_path.replace('.pt', f'_step_{step}.pt')
@@ -174,11 +197,13 @@ def train(
                 checkpoint_path_with_step = checkpoint_path
                 meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path
 
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save(checkpoint_path_with_step)
+            if not is_discovering:
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.save(checkpoint_path_with_step)
 
-            unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
-            unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
+            if is_discovering:
+                unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
+                unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
 
             accelerator.print(f"Model saved to {checkpoint_path_with_step}, MetaController to {meta_controller_checkpoint_path_with_step}")
 
@@ -190,7 +215,6 @@ def train(
         init_kwargs = {}
         if exists(wandb_run_name):
             init_kwargs["wandb"] = {"name": wandb_run_name}
-        
         accelerator.init_trackers(
             wandb_project,
             config = {
@@ -205,7 +229,6 @@ def train(
                 "env_id": env_id,
                 "state_loss_weight": state_loss_weight,
                 "action_loss_weight": action_loss_weight,
-                "discovery_kl_loss_weight": discovery_kl_loss_weight,
             },
             init_kwargs = init_kwargs
         )
@@ -222,9 +245,9 @@ def train(
     # state: (B, T, H, W, C) where C is num_channels (one-hot encoded)
 
     state_shape = replay_buffer.shapes['state']
-    state_dim = int(torch.tensor(state_shape).prod().item())  # H * W * C
-
-    # deduce num_actions from a temporary environment
+    if use_resnet: state_dim = 256
+    else:
+        state_dim = int(torch.tensor(state_shape).prod().item())
 
     temp_env = create_pinpad_env(env_id, num_objects, default_obj_seq, room_size, num_rows, num_cols)
     num_actions = int(temp_env.action_space.n)
@@ -233,25 +256,54 @@ def train(
     accelerator.print(f"Detected state_dim: {state_dim}, num_actions: {num_actions} from env: {env_id}")
     accelerator.print(f"State shape from replay buffer: {state_shape}")
 
-    # meta controller
+    meta_controller = MetaController(dim, switch_temperature=switch_temperature)
 
-    meta_controller = MetaController(dim)
+    transformer_class = TransformerWithResnet if use_resnet else Transformer
 
-    # transformer (no ResNet for one-hot encoded states)
-
-    model = Transformer(
-        dim = dim,
-        state_embed_readout = dict(num_continuous = state_dim),
-        action_embed_readout = dict(num_discrete = num_actions),
-        lower_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
-        upper_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
-        meta_controller = meta_controller,
+    transformer_kwargs = dict(
+        dim=dim,
+        state_embed_readout=dict(num_continuous=state_dim),
+        action_embed_readout=dict(num_discrete=num_actions),
+        lower_body=dict(depth=depth, heads=heads, attn_dim_head=dim_head),
+        upper_body=dict(depth=depth, heads=heads, attn_dim_head=dim_head),
+        meta_controller=meta_controller,
     )
 
-    # optimizer
+    model = transformer_class(**transformer_kwargs)
 
-    optim_model = AdamW(model.parameters(), lr = lr, weight_decay = weight_decay)
-    optim_meta_controller = AdamW(meta_controller.discovery_parameters(), lr = discovery_lr, weight_decay = discovery_weight_decay)
+    if exists(load_transformer_weights_path):
+        _path = Path(load_transformer_weights_path)
+        assert _path.exists(), f"load_transformer_weights_path {load_transformer_weights_path} does not exist"
+        if hasattr(model, "load"):
+            model.load(str(_path))
+        else:
+            state = torch.load(_path, map_location="cpu", weights_only=True)
+            model.load_state_dict(state, strict=False)
+        accelerator.print(f"Loaded transformer weights from {load_transformer_weights_path}")
+    else:
+        for name, child in model.named_children():
+            if name != "meta_controller":
+                child.apply(initialize_weights_xavier)
+        accelerator.print("Initialized transformer with Xavier")
+
+    if exists(load_meta_controller_weights_path):
+        _path = Path(load_meta_controller_weights_path)
+        assert _path.exists(), f"load_meta_controller_weights_path {load_meta_controller_weights_path} does not exist"
+        if hasattr(meta_controller, "load"):
+            meta_controller.load(str(_path))
+        else:
+            state = torch.load(_path, map_location="cpu", weights_only=True)
+            meta_controller.load_state_dict(state, strict=False)
+        accelerator.print(f"Loaded meta_controller weights from {load_meta_controller_weights_path}")
+    else:
+        meta_controller.apply(initialize_weights_xavier)
+        accelerator.print("Initialized meta_controller with Xavier")
+
+    optim_model = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optim_meta_controller = AdamW([
+        {"params": meta_controller.discovery_parameters_non_switching(), "lr": discovery_lr},
+        {"params": meta_controller.discovery_parameters_switching_unit(), "lr": 0.0},
+    ], weight_decay=discovery_weight_decay)
 
     # prepare
 
@@ -272,40 +324,53 @@ def train(
         optim = optim_model if not is_discovering else optim_meta_controller
 
         for batch in progress_bar:
-            
-            # batch fields: state (B, T, H, W, C), action (B, T), label (B, T)
-            # state is one-hot encoded: (B, T, H, W, num_channels)
-
             states = batch['state'].float()
             actions = batch['action'].long()
-            labels = batch['label'].long()
+            labels = batch.get('label')
+            if labels is not None:
+                labels = labels.long()
             episode_lens = batch.get('_lens')
 
-            # flatten state: (B, T, H, W, C) -> (B, T, H*W*C)
-            states = rearrange(states, 'b t ... -> b t (...)')
+            if condition_on_mission_embed and exists(mission_embeddings):
+                mission_embeddings = mission_embeddings.to(accelerator.device)
+            else:
+                mission_embeddings = None
+
+            if use_resnet: 
+                states = model.visual_encode(states)
+            else: # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
+                states = rearrange(states, 'b t ... -> b t (...)')
 
             with accelerator.accumulate(model):
                 losses, meta_controller_output = model(
                     states,
                     actions,
-                    episode_lens = episode_lens,
-                    discovery_phase = is_discovering,
-                    force_behavior_cloning = not is_discovering,
-                    return_meta_controller_output = True,
+                    episode_lens=episode_lens,
+                    discovery_phase=is_discovering,
+                    force_behavior_cloning=not is_discovering,
+                    return_meta_controller_output=True,
+                    condition=mission_embeddings,
                 )
 
                 if is_discovering:
-                    action_recon_loss, kl_loss = losses
+                    obs_loss, action_recon_loss, kl_loss = losses
 
                     loss = (
+                        obs_loss * discovery_obs_loss_weight +
                         action_recon_loss * discovery_action_recon_loss_weight +
                         kl_loss * discovery_kl_loss_weight
                     )
 
+                    warmup_factor = min(1.0, (gradient_step + 1) / discovery_switch_warmup_steps)
+                    switch_lr = discovery_lr * discovery_switch_lr_scale * warmup_factor
+                    optim_meta_controller.param_groups[1]["lr"] = switch_lr
+
                     log = dict(
-                        action_recon_loss = action_recon_loss.item(),
-                        kl_loss = kl_loss.item(),
-                        switch_density = meta_controller_output.switch_beta.mean().item()
+                        obs_loss=obs_loss.item(),
+                        action_recon_loss=action_recon_loss.item(),
+                        kl_loss=kl_loss.item(),
+                        switch_density=meta_controller_output.switch_beta.mean().item(),
+                        switch_lr_warmup=warmup_factor,
                     )
 
                 else:
@@ -321,9 +386,7 @@ def train(
                         action_loss = action_loss.item(),
                     )
 
-                # gradient accumulation
-
-                if gradient_accumulation_steps is not None: 
+                if gradient_accumulation_steps is not None:
                     loss /= gradient_accumulation_steps
 
                 # backprop
@@ -359,26 +422,24 @@ def train(
 
             if gradient_step % save_steps == 0:
                 accelerator.wait_for_everyone()
-                store_checkpoint(gradient_step)
+                store_checkpoint(gradient_step, is_discovering)
 
-                # visualize switch betas vs GT labels during discovery phase
-                if is_discovering and use_wandb and accelerator.is_main_process:
+                if is_discovering and use_wandb and accelerator.is_main_process and labels is not None:
                     visualize_switch_betas_vs_labels(
                         switch_betas=meta_controller_output.switch_beta,
-                        labels=batch['label'],
+                        labels=labels,
                         episode_lens=episode_lens,
                         gradient_step=gradient_step,
                         num_samples=3,
-                        num_random_dims=2
                     )
 
         avg_losses = {k: v / len(dataloader) for k, v in total_losses.items()}
         avg_losses_str = ", ".join([f"{k}={v:.4f}" for k, v in avg_losses.items()])
         accelerator.print(f"Epoch {epoch}: {avg_losses_str}")
 
-    # save weights
+     # save weights
     accelerator.wait_for_everyone()
-    store_checkpoint()
+    store_checkpoint(None, is_discovering)
 
     accelerator.end_training()
 

@@ -28,6 +28,7 @@ from minigrid.core.world_object import Ball, Box, Key, Goal
 from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX
 from minigrid.envs.babyai.core.verifier import GoToInstr, ObjDesc, BeforeInstr, AndInstr
 from minigrid.utils.baby_ai_bot import BabyAIBot
+from minigrid.wrappers import FullyObsWrapper
 
 from memmap_replay_buffer import ReplayBuffer
 
@@ -272,7 +273,7 @@ class BabyAIBotEpsilonGreedy:
         self.last_action = action
         return action
 
-def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob, state_shape, visualize=False):
+def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob, state_shape, one_hot=False, visualize=False):
     """
     Collect a single episode of demonstrations.
     
@@ -289,7 +290,11 @@ def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob,
     """
 
     env = gym.make(env_id, render_mode="rgb_array", obj_seq=obj_seq)
-    env = OneHotFullyObsWrapper(env)
+
+    if one_hot:
+        env = OneHotFullyObsWrapper(env)
+    else:
+        env = FullyObsWrapper(env)
 
     try:
         state_obs, _ = env.reset(seed=seed)
@@ -327,7 +332,10 @@ def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob,
                 return None, None, None, None, False, 0
 
             episode_label[_step] = obj_idx
-            episode_state[_step] = state_obs["one_hot"]
+            if one_hot:
+                episode_state[_step] = state_obs["one_hot"]
+            else:
+                episode_state[_step] = state_obs["image"]
             episode_action[_step] = action
 
             state_obs, reward, terminated, truncated, info = env.step(action)
@@ -360,6 +368,7 @@ def collect_demonstrations(
     num_workers = None,
     output_dir = "pinpad_demonstrations",
     visualize = False,
+    one_hot = False,
 ):
     """
     Collect demonstrations using BabyAI Bot for the PinPad environment.
@@ -388,8 +397,12 @@ def collect_demonstrations(
 
     # Determine state shape from environment
     temp_env = gym.make(env_id, obj_seq=obj_seqs[0])
-    temp_env = OneHotFullyObsWrapper(temp_env)
-    state_shape = temp_env.observation_space['one_hot'].shape
+    if one_hot:
+        temp_env = OneHotFullyObsWrapper(temp_env)
+        state_shape = temp_env.observation_space['one_hot'].shape
+    else:
+        temp_env = FullyObsWrapper(temp_env)
+        state_shape = temp_env.observation_space['image'].shape
     temp_env.close()
 
     logger.info(f"Detected state shape: {state_shape} for env {env_id}")
@@ -449,7 +462,7 @@ def collect_demonstrations(
                 obj_seq, seed = task
                 future = executor.submit(
                     collect_single_episode, env_id, obj_seq, seed, 
-                    num_steps, random_action_prob, state_shape, visualize
+                    num_steps, random_action_prob, state_shape, one_hot, visualize,
                 )
                 futures[future] = task
 
