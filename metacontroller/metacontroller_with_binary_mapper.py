@@ -70,24 +70,30 @@ class MetaControllerWithBinaryMapper(Module):
         hypernetwork_low_rank = 16,
         assoc_scan_kwargs: dict = dict(),
         bidirectional_temporal_encoder_kwargs: dict = dict(
-            attn_dim_head = 32, heads = 8
+            attn_dim_head = 32,
+            heads = 8,
+            depth = 2,
+            polar_pos_emb = True
         ),
         action_proposer: Module | dict = dict(
-            depth = 1,
+            depth = 2,
             attn_dim_head = 32,
-            heads = 8
+            heads = 8,
+            polar_pos_emb = True
         ),
         kl_loss_threshold = 0.,
-        switch_temperature = 0.1
+        switch_temperature = 0.1,
+        hard_switch = None
     ):
         super().__init__()
         self.dim_model = dim_model
+        self.hard_switch = hard_switch
 
         dim_meta = default(dim_meta_controller, dim_model)
 
         self.model_to_meta = Linear(dim_model, dim_meta)
 
-        self.bidirectional_temporal_encoder = Encoder(dim = dim_meta, depth = 1, **bidirectional_temporal_encoder_kwargs)
+        self.bidirectional_temporal_encoder = Encoder(dim = dim_meta, **bidirectional_temporal_encoder_kwargs)
 
         self.emitter = GRU(dim_meta * 2, dim_meta * 2)
         self.emitter_to_binary_logits = Linear(dim_meta * 2, dim_code_bits)
@@ -221,7 +227,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         meta_embed = self.model_to_meta(residual_stream)
 
-        hard_switch = default(hard_switch, not discovery_phase) # think during internal RL phase, it needs to be a hard switch, then only the actions emitted during the switch is reinforced
+        hard_switch = default(hard_switch, self.hard_switch, not discovery_phase) # think during internal RL phase, it needs to be a hard switch, then only the actions emitted during the switch is reinforced
 
         if discovery_phase:
 
