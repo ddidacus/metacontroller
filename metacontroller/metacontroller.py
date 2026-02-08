@@ -195,12 +195,15 @@ class MetaController(Module):
         assoc_scan_kwargs: dict = dict(),
         bidirectional_temporal_encoder_kwargs: dict = dict(
             attn_dim_head = 32,
-            heads = 8
+            heads = 8,
+            depth = 2,
+            polar_pos_emb = True
         ),
         action_proposer: Module | dict = dict(
-            depth = 1,
+            depth = 2,
             attn_dim_head = 32,
-            heads = 8
+            heads = 8,
+            polar_pos_emb = True
         ),
         #switch_temperature = 0.5,
         switch_temperature = 1.0,
@@ -218,7 +221,7 @@ class MetaController(Module):
 
         # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use bidirectional attention as placeholder
 
-        self.bidirectional_temporal_encoder = Encoder(dim = dim_meta, depth = 1, **bidirectional_temporal_encoder_kwargs)
+        self.bidirectional_temporal_encoder = Encoder(dim = dim_meta, **bidirectional_temporal_encoder_kwargs)
 
         self.emitter = GRU(dim_meta * 2, dim_meta * 2)
         self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
@@ -526,8 +529,6 @@ class Transformer(Module):
         assert lower_attn_dim_head == upper_attn_dim_head
         assert lower_heads == upper_heads
 
-        self.polar_pos_emb = PolarEmbedding(lower_attn_dim_head, heads = lower_heads)
-
         # meta controller
 
         self.meta_controller = meta_controller 
@@ -626,8 +627,6 @@ class Transformer(Module):
 
         pos = torch.arange(seq_len, device = device)
 
-        polar_pos_emb = self.polar_pos_emb(pos)
-
         # transformer lower body
 
         with lower_transformer_context():
@@ -650,8 +649,6 @@ class Transformer(Module):
                 embed,
                 condition = condition,
                 cache = lower_transformer_hiddens,
-                polar_pos_emb = polar_pos_emb,
-                seq_pos_offset = cache_steps,
                 return_hiddens = True
             )
 
@@ -675,7 +672,6 @@ class Transformer(Module):
                 modified_residual_stream,
                 condition = condition,
                 cache = upper_transformer_hiddens,
-                polar_pos_emb = polar_pos_emb,
                 return_hiddens = True
             )
 

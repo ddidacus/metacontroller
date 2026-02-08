@@ -4,7 +4,7 @@
 #   "gymnasium",
 #   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.12",
-#   "metacontroller-pytorch>=0.0.57",
+#   "metacontroller-pytorch>=0.1.0",
 #   "minigrid",
 #   "tqdm",
 #   "wandb",
