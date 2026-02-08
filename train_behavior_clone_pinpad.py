@@ -17,6 +17,7 @@
 import fire
 from tqdm import tqdm
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -315,8 +316,11 @@ def train(
     gradient_step = 0
     for epoch in range(cloning_epochs + discovery_epochs):
 
-        model.train()
-        from collections import defaultdict
+        if is_discovering:
+            model.train_discovery()
+        else:
+            model.train()
+
         total_losses = defaultdict(float)
 
         progress_bar = tqdm(dataloader, desc = f"Epoch {epoch}", disable = not accelerator.is_local_main_process)
