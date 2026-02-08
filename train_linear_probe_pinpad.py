@@ -334,7 +334,6 @@ def train(
             states = batch['state'].float()
             actions = batch['action'].long()
 
-            print("actions: ", actions.unique())
             labels = batch.get('label')
             if labels is not None:
                 labels = labels.long()
