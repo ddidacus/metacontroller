@@ -300,8 +300,12 @@ def train(
             
             # batch is a NamedTuple (e.g. MemoryMappedBatch)
             # state: (B, T, 7, 7, 3), action: (B, T)
-
+            # normalize inputs to be first in [0, 1] by dividing by 255
+            # then normalize w.r.t. mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]
             states = batch['state'].float()
+            states = torch.clamp(states / 255.0, min=0.0, max=1.0)
+            states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
+
             actions = batch['action'].long()
             episode_lens = batch.get('_lens')
             mission_embeddings = batch.get('mission_embedding')

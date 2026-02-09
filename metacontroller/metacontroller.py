@@ -519,7 +519,6 @@ class Transformer(Module):
         self.upper_body = upper_body
 
         # polar positional embedding
-
         lower_attn_dim_head = lower_body.attn_dim_head
         lower_heads = lower_body.attn_heads
 
@@ -530,13 +529,10 @@ class Transformer(Module):
         assert lower_heads == upper_heads
 
         # meta controller
-
         self.meta_controller = meta_controller
-
         self.register_buffer('zero', tensor(0.), persistent = False)
 
         # ensure devices match
-        
         if exists(self.meta_controller): self._ensure_consistent_device(self.meta_controller)
 
     def _ensure_consistent_device(self, network):
@@ -623,7 +619,8 @@ class Transformer(Module):
             # since the pretraining task is (current) action prediction and next-statep rediction
             # target_actions = action[t]
 
-            state, target_state = state[:, :-1], state[:, 1:]
+            # IMPORTANT: we need to add a stop_grad to the target_state to prevent representation collapse.
+            state, target_state = state[:, :-1], state[:, 1:].clone().detach()
             target_actions = actions[:, :-1]
             #actions, target_actions = actions[:, :-1], actions[:, 1:]
 
@@ -631,9 +628,7 @@ class Transformer(Module):
                 episode_lens = (episode_lens - 1).clamp(min = 0)
 
         # positional embedding
-
         seq_len = state.shape[1]
-
         pos = torch.arange(seq_len, device = device)
 
         # transformer lower body
@@ -684,8 +679,7 @@ class Transformer(Module):
                 condition = condition,
                 cache = upper_transformer_hiddens,
                 return_hiddens = True
-            )
-
+            )            
             # head readout
             dist_params = self.action_readout(attended)
 

@@ -341,7 +341,6 @@ def train(
             # then normalize w.r.t. mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]
             states = batch['state'].float()
             states = torch.clamp(states / 255.0, min=0.0, max=1.0)
-            # this step may need broadcasting to handle different no. of dims
             states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
 
             actions = batch['action'].long()
@@ -350,13 +349,6 @@ def train(
             if labels is not None:
                 labels = labels.long()
             episode_lens = batch.get('_lens')
-
-            # let's crop states, actions, and labels to the minimum episode length
-            episode_lens = episode_lens.clamp(max=episode_lens.min().item())
-            states = states[:, :episode_lens.min().item()]
-            actions = actions[:, :episode_lens.min().item()]
-            if labels is not None:
-                labels = labels[:, :episode_lens.min().item()]
 
             if condition_on_mission_embed and exists(mission_embeddings):
                 mission_embeddings = mission_embeddings.to(accelerator.device)
@@ -386,8 +378,8 @@ def train(
                 # residual_stream is (B, T-1, dim) from BC's state[:, :-1]
                 labels_probe = labels[:, :-1]  # (B, T-1) to align with residual_stream
                 logits = probe(residual_stream)  # (B, T-1, num_objects)
-                #seq_len = logits.shape[1]
-                seq_len = episode_lens.min().item()
+                seq_len = logits.shape[1]
+                #seq_len = episode_lens.min().item()
 
                 # Valid positions: within episode and label != -1 (explore)
                 if episode_lens is not None:
@@ -456,7 +448,10 @@ def train(
                         within_episode = torch.arange(seq_len, device=action_logits.device)[None, :] < ep_len_eff[:, None]
                     else:
                         within_episode = torch.ones(action_logits.shape[0], seq_len, dtype=torch.bool, device=action_logits.device)
-                    action_acc = (pred_actions[:, :episode_lens.min().item() - 1] == target_actions[:, :episode_lens.min().item() - 1]).float().mean().item()
+                    
+                    # modify the action accuracy s.t. only the predictions within each episode_length are considered
+                    action_acc = (pred_actions[within_episode] == target_actions[within_episode]).float().mean().item()
+                    #action_acc = (pred_actions[:, :episode_lens.min().item() - 1] == target_actions[:, :episode_lens.min().item() - 1]).float().mean().item()
 
                     accelerator.backward(loss)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
