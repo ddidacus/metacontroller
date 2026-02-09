@@ -70,12 +70,16 @@ class MetaControllerWithBinaryMapper(Module):
         hypernetwork_low_rank = 16,
         assoc_scan_kwargs: dict = dict(),
         bidirectional_temporal_encoder_kwargs: dict = dict(
-            attn_dim_head = 32, heads = 8
+            attn_dim_head = 32,
+            heads = 8,
+            depth = 2,
+            polar_pos_emb = True
         ),
         action_proposer: Module | dict = dict(
-            depth = 1,
+            depth = 2,
             attn_dim_head = 32,
-            heads = 8
+            heads = 8,
+            polar_pos_emb = True
         ),
         kl_loss_threshold = 0.,
         switch_temperature = 0.1,
@@ -89,7 +93,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         self.model_to_meta = Linear(dim_model, dim_meta)
 
-        self.bidirectional_temporal_encoder = Encoder(dim = dim_meta, depth = 1, **bidirectional_temporal_encoder_kwargs)
+        self.bidirectional_temporal_encoder = Encoder(dim = dim_meta, **bidirectional_temporal_encoder_kwargs)
 
         self.emitter = GRU(dim_meta * 2, dim_meta * 2)
         self.emitter_to_binary_logits = Linear(dim_meta * 2, dim_code_bits)
