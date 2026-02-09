@@ -487,7 +487,7 @@ class Transformer(Module):
         lower_body: Decoder | dict,
         upper_body: Decoder | dict,
         meta_controller: MetaController | None = None,
-        dim_condition = None
+        dim_condition = None,
     ):
         super().__init__()
 
@@ -530,7 +530,7 @@ class Transformer(Module):
 
         # meta controller
 
-        self.meta_controller = meta_controller 
+        self.meta_controller = meta_controller
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -576,6 +576,7 @@ class Transformer(Module):
         episode_lens: Tensor | None = None,
         return_meta_controller_output = False,
         return_residual_stream = False,
+        return_action_logits = False,
         condition = None
     ):
         device = state.device
@@ -614,8 +615,16 @@ class Transformer(Module):
 
             assert exists(actions), f'`actions` cannot be empty when doing discovery or behavioral cloning'
 
+            # states and actions are temporally aligned:
+            # state[t] = obs at time t (before taking action a_t)
+            # action[t] = action taken at time t from state[t]
+            # state[t+1] = obs at time t+1 (after taking action a_t)
+            # since the pretraining task is (current) action prediction and next-statep rediction
+            # target_actions = action[t]
+
             state, target_state = state[:, :-1], state[:, 1:]
-            actions, target_actions = actions[:, :-1], actions[:, 1:]
+            target_actions = actions[:, :-1]
+            #actions, target_actions = actions[:, :-1], actions[:, 1:]
 
             if exists(episode_lens):
                 episode_lens = (episode_lens - 1).clamp(min = 0)
@@ -644,7 +653,9 @@ class Transformer(Module):
             if action_embed.shape[-2] == (state_embed.shape[-2] - 1):
                 action_embed = pad_at_dim(action_embed, (1, 0), dim = 1)
 
-            embed = state_embed + action_embed
+            # according to the paper, the inputs should only be the state embeddings
+            #embed = state_embed + action_embed
+            embed = state_embed
 
             residual_stream, next_lower_hiddens = self.lower_body(
                 embed,
@@ -680,7 +691,6 @@ class Transformer(Module):
             )
 
             # head readout
-
             dist_params = self.action_readout(attended)
 
         # maybe return behavior cloning loss
@@ -693,11 +703,22 @@ class Transformer(Module):
             state_dist_params = self.state_readout(attended)
             state_clone_loss = self.state_readout.calculate_loss(state_dist_params, target_state, mask = loss_mask)
 
-            # action
-            action_clone_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = loss_mask)
+            # assert that
+            # 1) episode_len == sum(loss_mask, dim = -1)
+            assert torch.allclose(episode_lens.float(), loss_mask.sum(dim = -1).float()), f"episode_len: {episode_lens}, loss_mask: {loss_mask.sum(dim = -1)}"
 
+            # action
+            action_clone_loss = self.action_readout.calculate_loss(dist_params, target_actions, mask = loss_mask) 
             losses = BehavioralCloningLosses(state_clone_loss, action_clone_loss)
 
+            if return_action_logits:
+                if return_residual_stream:
+                    if not return_meta_controller_output:
+                        return losses, dist_params, residual_stream
+                    return losses, dist_params, next_meta_hiddens, residual_stream
+                if not return_meta_controller_output:
+                    return losses, dist_params
+                return losses, dist_params, next_meta_hiddens
             if return_residual_stream:
                 if not return_meta_controller_output:
                     return losses, residual_stream
