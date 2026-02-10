@@ -371,7 +371,7 @@ def test_discovery_vs_bc_ablation_parity():
             state,
             actions = actions,
             discovery_phase = True,
-            ablate_control_signal = True,
+            control_signal_multiplier = 0.,
             return_meta_controller_output = True
         )
 

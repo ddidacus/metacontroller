@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader, Dataset
 from accelerate import Accelerator
 from einops import rearrange
 
-from metacontroller import MetaController, Transformer
+from metacontroller import MetaController, Transformer, binary_entropy
 
 # helpers
 
@@ -51,21 +51,22 @@ def decode_tokens(tokens):
 def visualize_segments(
     tokens: Tensor,
     switch_betas: Tensor,
-    delimiter = " \u275A "
+    delimiter = " \u275A ",
+    threshold = 0.5
 ):
     tokens_list = tokens.tolist()
-    switches = (switch_betas > 0.5).tolist()
+    switches = (switch_betas >= threshold).tolist()
 
     segments = []
     curr_segment = []
 
     for i in range(len(switches)):
-        curr_segment.append(tokens_list[i])
-        if switches[i]:
+        if switches[i] and i > 0:
             segments.append(decode_tokens(curr_segment))
             curr_segment = []
+        curr_segment.append(tokens_list[i])
 
-    # Append any remaining tokens (including the last one which is not a 'state' but a 'target')
+    # Append any remaining tokens
     curr_segment.extend(tokens_list[len(switches):])
 
     if curr_segment:
@@ -139,8 +140,9 @@ class TextSamplerDataset(Dataset):
 # train function
 
 def train(
-    num_bc_batches = 10_000,
-    num_discovery_batches = 10_000,
+    num_bc_batches = 5000,
+    num_discovery_batches = 5000,
+    discovery_warmup_steps = 0,
     batch_size = 4,
     grad_accum_every = 4,
     learning_rate = 1e-4,
@@ -149,7 +151,8 @@ def train(
     bc_action_loss_weight = 1.,
     discovery_state_loss_weight = 1.,
     discovery_action_loss_weight = 1.,
-    discovery_kl_loss_weight = 0.01,
+    discovery_kl_loss_weight = 0.1,
+    discovery_entropy_loss_weight = 0.1,
     ratio_loss_weight = 1.,
     validate_every = 100,
     generate_every = 250,
@@ -157,8 +160,8 @@ def train(
     generate_length = 512,
     seq_len = 128,
     dim = 512,
-    dim_meta_controller = 256,
-    dim_latent = 128,
+    dim_meta_controller = 128,
+    dim_latent = 64,
     depth = 3,
     heads = 8,
     attn_dim_head = 48,
@@ -191,7 +194,7 @@ Grad Accum Every:   {grad_accum_every}
 BC Learning Rate:   {learning_rate}
 Disc Learning Rate: {discovery_learning_rate}
 BC Loss Weights:    state: {bc_state_loss_weight} action: {bc_action_loss_weight}
-Disc Loss Weights:  state: {discovery_state_loss_weight} action: {discovery_action_loss_weight} kl: {discovery_kl_loss_weight} ratio: {ratio_loss_weight}
+Disc Loss Weights:  state: {discovery_state_loss_weight} action: {discovery_action_loss_weight} kl: {discovery_kl_loss_weight} entropy: {discovery_entropy_loss_weight} ratio: {ratio_loss_weight}
 Seq Len:            {seq_len}
 CPU:                {cpu}
 Model Dim:          {dim}
@@ -200,6 +203,7 @@ Latent Dim:         {dim_latent}
 Depth:              {depth}
 Heads:              {heads}
 Target Seg Len:     {target_temporal_segment_len}
+Warmup Steps:       {discovery_warmup_steps}
 Checkpoint Path:    {checkpoint_path}
 {'='*50}
 """)
@@ -287,7 +291,7 @@ Checkpoint Path:    {checkpoint_path}
                 state = state,
                 actions = actions,
                 discovery_phase = True,
-                ablate_control_signal = True,
+                control_signal_multiplier = 0.0,
                 return_meta_controller_output = True
             )
 
@@ -323,11 +327,17 @@ Checkpoint Path:    {checkpoint_path}
             state = data[:, :-1]
             actions = data[:, 1:]
 
+            multiplier = 1.0
+            if is_discovering and discovery_warmup_steps > 0:
+                discovery_step = i - num_bc_batches
+                multiplier = min(1.0, discovery_step / discovery_warmup_steps)
+
             outputs = model(
                 state = state,
                 actions = actions,
                 discovery_phase = is_discovering,
                 force_behavior_cloning = not is_discovering,
+                control_signal_multiplier = multiplier,
                 return_meta_controller_output = is_discovering
             )
 
@@ -335,16 +345,20 @@ Checkpoint Path:    {checkpoint_path}
                 discovery_losses, meta_output = outputs
                 obs_loss, action_recon_loss, kl_loss, ratio_loss = discovery_losses
                 
+                entropy_loss = binary_entropy(meta_output.switch_beta).mean()
+
                 loss = (action_recon_loss + 0.5) * discovery_action_loss_weight + \
                        (obs_loss + 0.5) * discovery_state_loss_weight + \
                        kl_loss * discovery_kl_loss_weight + \
+                       entropy_loss * discovery_entropy_loss_weight + \
                        ratio_loss
                 
                 last_state_loss = obs_loss.item()
                 last_action_loss = action_recon_loss.item()
-                last_switch_density = meta_output.switch_beta.mean().item()
+                last_switch_density = (meta_output.switch_beta > 0.5).float().mean().item()
                 last_ratio_loss = ratio_loss.item()
                 last_kl_loss = kl_loss.item()
+                last_entropy_loss = entropy_loss.item()
             else:
                 state_loss, action_loss = outputs
                 loss = (action_loss + 0.5) * bc_action_loss_weight + \
@@ -369,7 +383,7 @@ Checkpoint Path:    {checkpoint_path}
             log_str = f"{i}: loss: {last_loss:.3f} ({phase}) state: {last_state_loss:.3f} {action_loss_key}: {last_action_loss:.3f}"
             
             if is_discovering:
-                log_str += f" density: {last_switch_density:.3f} kl: {last_kl_loss:.3f} ratio: {last_ratio_loss:.3f}"
+                log_str += f" density: {last_switch_density:.3f} kl: {last_kl_loss:.3f} entropy: {last_entropy_loss:.3f} ratio: {last_ratio_loss:.3f}"
                 pbar.set_postfix(state=f"{last_state_loss:.3f}", action_recon=f"{last_action_loss:.3f}", density=f"{last_switch_density:.3f}", kl=f"{last_kl_loss:.3f}")
             else:
                 pbar.set_postfix(state=f"{last_state_loss:.3f}", action=f"{last_action_loss:.3f}")
@@ -397,8 +411,8 @@ Checkpoint Path:    {checkpoint_path}
                     discovery_losses, meta_output = outputs
                     loss_val = discovery_losses.action_recon + discovery_losses.state_pred
                     
-                    segmented_str = visualize_segments(valid_data[0], meta_output.switch_beta[0])
-                    accelerator.print(f"\nSEGMENTED: {segmented_str}\n")
+                    segmented_str = visualize_segments(valid_data[0], meta_output.switch_beta[0], threshold = 0.5)
+                    accelerator.print(f"\n\nSEGMENTED: {segmented_str}\n")
                 else:
                     loss_val = outputs.action + outputs.state
 

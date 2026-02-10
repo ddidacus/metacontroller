@@ -53,10 +53,16 @@ def default(*args):
             return arg
     return None
 
+# tensor helpers
+
+def log(t, eps = 1e-8):
+    return (t + eps).log()
+
+def binary_entropy(p):
+    return -((p * log(p)) + (1. - p) * log(1. - p))
+
 def straight_through(src, tgt):
     return tgt + src - src.detach()
-
-# tensor helpers
 
 # action proposer wrapper
 # normalizes any action proposer to a standard interface for MetaController
@@ -273,7 +279,7 @@ class MetaController(Module):
         self.switching_unit = GRU(dim_meta + dim_latent, dim_meta)
 
         self.to_switching_unit_beta = nn.Linear(dim_meta, 1, bias = False)
-        nn.init.zeros_(self.to_switching_unit_beta.weight)
+        nn.init.xavier_uniform_(self.to_switching_unit_beta.weight)
 
         self.switch_temperature = switch_temperature
 
@@ -680,7 +686,7 @@ class Transformer(Module):
         return_action_logits = False,
         condition = None,
         return_embed = False,
-        ablate_control_signal = False
+        control_signal_multiplier = 1.
     ):
         device = state.device
 
@@ -786,8 +792,8 @@ class Transformer(Module):
             else:
                 control_signal, next_meta_hiddens = self.zero, None
 
-            if ablate_control_signal:
-                control_signal = control_signal * 0
+            if control_signal_multiplier != 1.0:
+                control_signal = control_signal * control_signal_multiplier
 
             modified_residual_stream = residual_stream + control_signal
 
