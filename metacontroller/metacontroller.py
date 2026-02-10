@@ -717,7 +717,9 @@ class Transformer(Module):
         if (behavioral_cloning or discovery_phase) and is_single_token:
             assert exists(cache) or return_cache, 'behavioral cloning or discovery phase must be used with sequences of length > 1 if not doing inference (caching)'
 
-        if (behavioral_cloning or discovery_phase) and not is_single_token:
+        calc_auto_regressive_loss = (behavioral_cloning or discovery_phase) and not is_single_token
+
+        if calc_auto_regressive_loss:
             # during behavior cloning and discovery phase, the network is predicting / reconstructing the next token
 
             assert exists(actions), f'`actions` cannot be empty when doing discovery or behavioral cloning'
@@ -818,7 +820,7 @@ class Transformer(Module):
 
         # maybe return behavior cloning loss
 
-        if behavioral_cloning:
+        if calc_auto_regressive_loss and behavioral_cloning:
 
             # state
 
@@ -849,7 +851,7 @@ class Transformer(Module):
 
             return losses, next_meta_hiddens
 
-        elif discovery_phase:
+        elif calc_auto_regressive_loss and discovery_phase:
 
             # state
 
