@@ -252,6 +252,8 @@ class MetaController(Module):
 
         # the linear that brings from model dimension 
 
+        self.summary_gru = GRU(dim_model, dim_model) # eq (12)
+
         self.model_to_meta = Linear(dim_model, dim_meta)
 
         # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use bidirectional attention as placeholder
@@ -322,6 +324,7 @@ class MetaController(Module):
 
     def discovery_parameters(self):
         return [
+            *self.summary_gru.parameters(),
             *self.model_to_meta.parameters(),
             *self.bidirectional_temporal_encoder.parameters(),
             *self.emitter.parameters(),
@@ -365,7 +368,9 @@ class MetaController(Module):
         self,
         residual_stream
     ):
-        meta_embed = self.model_to_meta(residual_stream)
+        summarized, _ = self.summary_gru(residual_stream)
+
+        meta_embed = self.model_to_meta(summarized)
 
         proposed_action_hidden, _ = self.action_proposer(meta_embed)
 
@@ -391,13 +396,19 @@ class MetaController(Module):
 
         # destruct prev cache
 
-        prev_action_proposer_hidden, prev_switching_unit_gru_hidden, prev_switch_gated_hiddens, prev_sampled_latent_action = cache.prev_hiddens if exists(cache) else ((None,) * 4)
+        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_gru_hidden, prev_switch_gated_hiddens, prev_sampled_latent_action = cache.prev_hiddens if exists(cache) else ((None,) * 5)
 
         # getting proposed action for the two phases
 
         next_action_proposer_hidden = None
 
-        meta_embed = self.model_to_meta(residual_stream)
+        # eq (12) - summarizing the input residual stream, then projecting it to meta controller dimension
+
+        summarized, next_summarized = self.summary_gru(residual_stream, prev_summarized)
+
+        meta_embed = self.model_to_meta(summarized)
+
+        # depending on discovery or internal RL phases
 
         if discovery_phase:
 
@@ -521,6 +532,7 @@ class MetaController(Module):
         # returning
 
         next_hiddens = (
+            next_summarized,
             next_action_proposer_hidden,
             next_switching_unit_gru_hidden,
             next_switch_gated_action,
