@@ -263,6 +263,37 @@ Checkpoint Path:    {checkpoint_path}
     train_loader = cycle(train_loader)
     val_loader = cycle(val_loader)
 
+    # validation sanity check if starting from discovery phase
+
+    if discovery_phase:
+        model.eval()
+        with torch.no_grad():
+            valid_data = next(val_loader)
+            state = valid_data[:, :-1]
+            actions = valid_data[:, 1:]
+
+            state_loss, action_loss = model(
+                state = state,
+                actions = actions,
+                force_behavior_cloning = True
+            )
+
+            loss_val = state_loss + action_loss
+            accelerator.print(f"\ninitial BC validation loss: {loss_val.item():.3f} (state: {state_loss.item():.3f} action: {action_loss.item():.3f})")
+
+            # discovery sanity check with ablated control signal
+
+            discovery_losses, _ = model(
+                state = state,
+                actions = actions,
+                discovery_phase = True,
+                ablate_control_signal = True,
+                return_meta_controller_output = True
+            )
+
+            state_recon_loss, action_recon_loss, _, _ = discovery_losses
+            accelerator.print(f"initial ablated discovery loss: {state_recon_loss.item() + action_recon_loss.item():.3f} (state: {state_recon_loss.item():.3f} action: {action_recon_loss.item():.3f})\n")
+
     # training
 
     start_step = num_bc_batches if discovery_phase else 0
@@ -284,6 +315,7 @@ Checkpoint Path:    {checkpoint_path}
         last_action_loss = 0.
         last_switch_density = 0.
         last_ratio_loss = 0.
+        last_kl_loss = 0.
 
         for _ in range(grad_accum_every):
             data = next(train_loader)
@@ -312,6 +344,7 @@ Checkpoint Path:    {checkpoint_path}
                 last_action_loss = action_recon_loss.item()
                 last_switch_density = meta_output.switch_beta.mean().item()
                 last_ratio_loss = ratio_loss.item()
+                last_kl_loss = kl_loss.item()
             else:
                 state_loss, action_loss = outputs
                 loss = (action_loss + 0.5) * bc_action_loss_weight + \
@@ -331,13 +364,13 @@ Checkpoint Path:    {checkpoint_path}
 
         if divisible_by(i, 10):
             phase = 'discovering' if is_discovering else 'cloning'
-            action_loss_key = 'recon' if is_discovering else 'action'
+            action_loss_key = 'action_recon' if is_discovering else 'action'
 
             log_str = f"{i}: loss: {last_loss:.3f} ({phase}) state: {last_state_loss:.3f} {action_loss_key}: {last_action_loss:.3f}"
             
             if is_discovering:
-                log_str += f" density: {last_switch_density:.3f} ratio: {last_ratio_loss:.3f}"
-                pbar.set_postfix(state=f"{last_state_loss:.3f}", recon=f"{last_action_loss:.3f}", density=f"{last_switch_density:.3f}")
+                log_str += f" density: {last_switch_density:.3f} kl: {last_kl_loss:.3f} ratio: {last_ratio_loss:.3f}"
+                pbar.set_postfix(state=f"{last_state_loss:.3f}", action_recon=f"{last_action_loss:.3f}", density=f"{last_switch_density:.3f}", kl=f"{last_kl_loss:.3f}")
             else:
                 pbar.set_postfix(state=f"{last_state_loss:.3f}", action=f"{last_action_loss:.3f}")
 

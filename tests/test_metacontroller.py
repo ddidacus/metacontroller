@@ -331,3 +331,49 @@ def test_transformer_bc_parity():
     sequential_logits = torch.cat(sequential_logits, dim = 1)
 
     assert torch.allclose(parallel_logits, sequential_logits, atol = 1e-5)
+
+def test_discovery_vs_bc_ablation_parity():
+    dim_model = 512
+    dim_meta = 256
+    dim_latent = 128
+    seq_len = 32
+    batch = 2
+
+    model = Transformer(
+        dim = dim_model,
+        action_embed_readout = dict(num_continuous = 8),
+        state_embed_readout = dict(num_continuous = 384),
+        lower_body = dict(depth = 1),
+        upper_body = dict(depth = 1),
+        meta_controller = MetaController(
+            dim_model = dim_model,
+            dim_meta_controller = dim_meta,
+            dim_latent = dim_latent
+        )
+    )
+
+    model.eval()
+
+    state = torch.randn(batch, seq_len + 1, 384)
+    actions = torch.randn(batch, seq_len + 1, 8)
+
+    # BC phase losses
+    with torch.no_grad():
+        bc_losses = model(
+            state,
+            actions = actions,
+            force_behavior_cloning = True
+        )
+
+    # Discovery phase losses with ablated control signal
+    with torch.no_grad():
+        discovery_losses, _ = model(
+            state,
+            actions = actions,
+            discovery_phase = True,
+            ablate_control_signal = True,
+            return_meta_controller_output = True
+        )
+
+    assert torch.allclose(bc_losses.state, discovery_losses.state_pred, atol = 1e-6)
+    assert torch.allclose(bc_losses.action, discovery_losses.action_recon, atol = 1e-6)

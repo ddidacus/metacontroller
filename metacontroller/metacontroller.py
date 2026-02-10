@@ -679,7 +679,8 @@ class Transformer(Module):
         return_residual_stream = False,
         return_action_logits = False,
         condition = None,
-        return_embed = False
+        return_embed = False,
+        ablate_control_signal = False
     ):
         device = state.device
 
@@ -784,6 +785,9 @@ class Transformer(Module):
                 control_signal, next_meta_hiddens = meta_controller(residual_stream, cache = meta_cache, discovery_phase = discovery_phase, temperature = meta_controller_temperature, episode_lens = episode_lens)
             else:
                 control_signal, next_meta_hiddens = self.zero, None
+
+            if ablate_control_signal:
+                control_signal = control_signal * 0
 
             modified_residual_stream = residual_stream + control_signal
 
