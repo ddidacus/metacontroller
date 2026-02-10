@@ -279,7 +279,7 @@ class MetaController(Module):
         # switching unit
 
         self.dim_latent = dim_latent
-        self.switching_unit = GRU(dim_meta + dim_latent, dim_meta)
+        self.switching_unit = GRU(dim_model + dim_meta + dim_latent, dim_meta)
 
         self.to_switching_unit_beta = nn.Linear(dim_meta, 1, bias = False)
         nn.init.xavier_uniform_(self.to_switching_unit_beta.weight)
@@ -411,6 +411,21 @@ class MetaController(Module):
 
         meta_embed = self.model_to_meta(summarized)
 
+        # construct meta embed (projected summarized) with a previous, so it can be used for emitter and switching unit
+        # convert to batch first
+
+        if not exists(prev_summarized):
+            prev_summarized = torch.zeros_like(next_summarized)
+
+        prev_summarized = rearrange(prev_summarized, 'n b d -> b n d')
+
+        # their h_(t-1)
+
+        meta_embed_prev = cat((
+            self.model_to_meta(prev_summarized),
+            meta_embed[:, :-1]
+        ), dim = 1)
+
         # depending on discovery or internal RL phases
 
         if discovery_phase:
@@ -426,13 +441,11 @@ class MetaController(Module):
 
             summarized_sequence_embed = repeat(summarized_sequence_embed, 'b d -> b n d', n = seq_len)
 
-            prev_meta_embed = pad_at_dim(meta_embed, (1, -1), dim = 1) # h_(t-1) for action emitter / encoder below
-
             # eq 15
 
             emitter_input = cat((
                 residual_stream,
-                prev_meta_embed,
+                meta_embed_prev,
                 summarized_sequence_embed
             ), dim = -1)
 
@@ -474,8 +487,13 @@ class MetaController(Module):
             z_prev = prev_sampled_latent_action
 
         # switch input is previous latent action and the embedding
+        # eq (16)
 
-        switch_input = torch.cat((meta_embed, z_prev), dim=-1)
+        switch_input = cat((
+            residual_stream,
+            meta_embed_prev,
+            z_prev
+        ), dim = -1)
 
         switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
             switch_input, 
