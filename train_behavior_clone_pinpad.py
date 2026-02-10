@@ -330,7 +330,12 @@ def train(
         optim = optim_model if not is_discovering else optim_meta_controller
 
         for batch in progress_bar:
+            # normalize inputs to be first in [0, 1] by dividing by 255
+            # then normalize w.r.t. mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]
             states = batch['state'].float()
+            states = torch.clamp(states / 255.0, min=0.0, max=1.0)
+            states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
+            
             actions = batch['action'].long()
             labels = batch.get('label')
             if labels is not None:
@@ -349,8 +354,8 @@ def train(
 
             with accelerator.accumulate(model):
                 losses, meta_controller_output = model(
-                    states,
-                    actions,
+                    state=states,
+                    actions=actions,
                     episode_lens=episode_lens,
                     discovery_phase=is_discovering,
                     force_behavior_cloning=not is_discovering,

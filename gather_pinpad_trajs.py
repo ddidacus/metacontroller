@@ -28,7 +28,7 @@ from minigrid.core.world_object import Ball, Box, Key, Goal
 from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX
 from minigrid.envs.babyai.core.verifier import GoToInstr, ObjDesc, BeforeInstr, AndInstr
 from minigrid.utils.baby_ai_bot import BabyAIBot
-from minigrid.wrappers import FullyObsWrapper
+from minigrid.wrappers import RGBImgObsWrapper
 
 from memmap_replay_buffer import ReplayBuffer
 
@@ -298,7 +298,7 @@ def collect_single_episode(env_id, obj_seq, seed, num_steps, random_action_prob,
     if one_hot:
         env = OneHotFullyObsWrapper(env)
     else:
-        env = FullyObsWrapper(env)
+        env = RGBImgObsWrapper(env)
 
     try:
         state_obs, _ = env.reset(seed=seed)
@@ -406,7 +406,7 @@ def collect_demonstrations(
         temp_env = OneHotFullyObsWrapper(temp_env)
         state_shape = temp_env.observation_space['one_hot'].shape
     else:
-        temp_env = FullyObsWrapper(temp_env)
+        temp_env = RGBImgObsWrapper(temp_env)
         state_shape = temp_env.observation_space['image'].shape
     temp_env.close()
 

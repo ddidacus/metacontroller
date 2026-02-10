@@ -676,6 +676,7 @@ class Transformer(Module):
         episode_lens: Tensor | None = None,
         return_meta_controller_output = False,
         return_residual_stream = False,
+        return_action_logits = False,
         condition = None
     ):
         device = state.device
@@ -753,7 +754,9 @@ class Transformer(Module):
 
                 action_embed = self.action_embed(past_actions)
 
-            embed = state_embed + action_embed
+            # following the paper: it doesn't make sense to use action as input to a model that's trained to predict the action
+            embed = state_embed
+            #embed = state_embed + action_embed
 
             residual_stream, next_lower_hiddens = self.lower_body(
                 embed,
@@ -792,6 +795,7 @@ class Transformer(Module):
         # maybe return behavior cloning loss
 
         if behavioral_cloning:
+            maybe_detach_target_state = torch.detach if self.state_loss_detach_target_state else identity
 
             loss_mask = maybe(lens_to_mask)(episode_lens, state.shape[1])
 
@@ -806,6 +810,14 @@ class Transformer(Module):
 
             losses = BehavioralCloningLosses(state_clone_loss, action_clone_loss)
 
+            if return_action_logits:
+                if return_residual_stream:
+                    if not return_meta_controller_output:
+                        return losses, dist_params, residual_stream
+                    return losses, dist_params, next_meta_hiddens, residual_stream
+                if not return_meta_controller_output:
+                    return losses, dist_params
+                return losses, dist_params, next_meta_hiddens
             if return_residual_stream:
                 if not return_meta_controller_output:
                     return losses, residual_stream
