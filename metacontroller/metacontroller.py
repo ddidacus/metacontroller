@@ -752,9 +752,9 @@ class Transformer(Module):
             action_embed = 0.
 
             if exists(actions) and exists(self.action_embed):
-                past_actions = pad_at_dim(actions, (1, -1), dim = 1)
 
-                action_embed = self.action_embed(past_actions)
+                action_embed = self.action_embed(actions[:, :-1])
+                action_embed = pad_left_at_dim(action_embed, 1, dim = 1)
 
             embed = state_embed + action_embed
 
