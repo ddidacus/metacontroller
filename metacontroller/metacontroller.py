@@ -233,6 +233,7 @@ class MetaController(Module):
             depth = 2,
             polar_pos_emb = True
         ),
+        dim_sequence_summary_embed = 32, # the summary embedding from the bidirectional network needs to be bottlenecked
         action_proposer: Module | dict = dict(
             depth = 2,
             attn_dim_head = 32,
@@ -260,7 +261,9 @@ class MetaController(Module):
 
         self.internal_sequence_embedder = Encoder(dim = dim_model, **bidirectional_temporal_encoder_kwargs)
 
-        self.emitter = GRU(dim_meta + dim_model * 2, dim_meta * 2)
+        self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
+
+        self.emitter = GRU(dim_meta + dim_model + dim_sequence_summary_embed, dim_meta * 2)
 
         self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
 
@@ -328,6 +331,7 @@ class MetaController(Module):
             *self.summary_gru.parameters(),
             *self.model_to_meta.parameters(),
             *self.internal_sequence_embedder.parameters(),
+            *self.to_sequence_summary_embed.parameters(),
             *self.emitter.parameters(),
             *self.emitter_to_action_mean_log_var.parameters(),
             *self.switching_unit.parameters(),
@@ -347,6 +351,7 @@ class MetaController(Module):
             *self.summary_gru.parameters(),
             *self.model_to_meta.parameters(),
             *self.internal_sequence_embedder.parameters(),
+            *self.to_sequence_summary_embed.parameters(),
             *self.emitter.parameters(),
             *self.emitter_to_action_mean_log_var.parameters(),
             *self.decoder.parameters(),
@@ -437,7 +442,9 @@ class MetaController(Module):
 
             encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask)
 
-            summarized_sequence_embed = masked_mean(encoded_residual_stream, mask, dim = 1)
+            mean_pooled = masked_mean(encoded_residual_stream, mask, dim = 1)
+
+            summarized_sequence_embed = self.to_sequence_summary_embed(mean_pooled)
 
             summarized_sequence_embed = repeat(summarized_sequence_embed, 'b d -> b n d', n = seq_len)
 
