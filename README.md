@@ -24,7 +24,7 @@ $ pip install metacontroller-pytorch
 
 - [Andrew Song](https://github.com/andrewsonga) for identifying a critical issue with past action embed handling and detaching gradients of target states
 
-- [Diego Calanzone](https://github.com/ddidacus) for identifying a missing summary GRU in the MetaController
+- [Diego Calanzone](https://github.com/ddidacus) for identifying inconsistencies in the MetaController
 
 ## Usage
 

@@ -258,9 +258,10 @@ class MetaController(Module):
 
         # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use bidirectional attention as placeholder
 
-        self.bidirectional_temporal_encoder = Encoder(dim = dim_meta, **bidirectional_temporal_encoder_kwargs)
+        self.internal_sequence_embedder = Encoder(dim = dim_model, **bidirectional_temporal_encoder_kwargs)
 
-        self.emitter = GRU(dim_meta * 2, dim_meta * 2)
+        self.emitter = GRU(dim_meta + dim_model * 2, dim_meta * 2)
+
         self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
 
         if isinstance(action_proposer, dict):
@@ -326,7 +327,7 @@ class MetaController(Module):
         return [
             *self.summary_gru.parameters(),
             *self.model_to_meta.parameters(),
-            *self.bidirectional_temporal_encoder.parameters(),
+            *self.internal_sequence_embedder.parameters(),
             *self.emitter.parameters(),
             *self.emitter_to_action_mean_log_var.parameters(),
             *self.switching_unit.parameters(),
@@ -343,8 +344,9 @@ class MetaController(Module):
 
     def discovery_parameters_non_switching(self):
         return [
+            *self.summary_gru.parameters(),
             *self.model_to_meta.parameters(),
-            *self.bidirectional_temporal_encoder.parameters(),
+            *self.internal_sequence_embedder.parameters(),
             *self.emitter.parameters(),
             *self.emitter_to_action_mean_log_var.parameters(),
             *self.decoder.parameters(),
@@ -392,6 +394,7 @@ class MetaController(Module):
         temperature = 1.,
         episode_lens: Tensor | None = None
     ):
+        seq_len = residual_stream.shape[1]
         device = residual_stream.device
 
         # destruct prev cache
@@ -417,9 +420,24 @@ class MetaController(Module):
 
             mask = maybe(lens_to_mask)(episode_lens, meta_embed.shape[1])
 
-            encoded_temporal = self.bidirectional_temporal_encoder(meta_embed, mask = mask)
+            encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask)
 
-            proposed_action_hidden, _ = self.emitter(cat((encoded_temporal, meta_embed), dim = -1))
+            summarized_sequence_embed = masked_mean(encoded_residual_stream, mask, dim = 1)
+
+            summarized_sequence_embed = repeat(summarized_sequence_embed, 'b d -> b n d', n = seq_len)
+
+            prev_meta_embed = pad_at_dim(meta_embed, (1, -1), dim = 1) # h_(t-1) for action emitter / encoder below
+
+            # eq 15
+
+            emitter_input = cat((
+                residual_stream,
+                prev_meta_embed,
+                summarized_sequence_embed
+            ), dim = -1)
+
+            proposed_action_hidden, _ = self.emitter(emitter_input)
+
             readout = self.emitter_to_action_mean_log_var
 
         else: # else internal rl phase
