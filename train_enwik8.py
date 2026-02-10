@@ -61,10 +61,10 @@ def visualize_segments(
     curr_segment = []
 
     for i in range(len(switches)):
-        if switches[i] and i > 0:
+        curr_segment.append(tokens_list[i])
+        if switches[i]:
             segments.append(decode_tokens(curr_segment))
             curr_segment = []
-        curr_segment.append(tokens_list[i])
 
     # Append any remaining tokens
     curr_segment.extend(tokens_list[len(switches):])
