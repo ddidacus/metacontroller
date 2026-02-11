@@ -107,6 +107,44 @@ DiscoveryLosses = namedtuple('DiscoveryLosses', (
     'ratio'
 ))
 
+# meta controller classes
+
+@save_load()
+class BidirectionalSequenceEmbedder(Module):
+    def __init__(
+        self,
+        dim,
+        **kwargs
+    ):
+        super().__init__()
+        self.encoder = Encoder(dim = dim, **kwargs)
+
+    def forward(
+        self,
+        x,
+        mask = None
+    ):
+        encoded = self.encoder(x, mask = mask)
+        mean_pooled = masked_mean(encoded, mask, dim = 1)
+        return repeat(mean_pooled, 'b d -> b n d', n = x.shape[1])
+
+@save_load()
+class CausalSequenceEmbedder(Module):
+    def __init__(
+        self,
+        dim,
+        **kwargs
+    ):
+        super().__init__()
+        self.decoder = Decoder(dim = dim, **kwargs)
+
+    def forward(
+        self,
+        x,
+        mask = None
+    ):
+        return self.decoder(x, mask = mask)
+
 # meta controller
 
 MetaControllerOutput = namedtuple('MetaControllerOutput', (
@@ -238,12 +276,13 @@ class MetaController(Module):
         decoder_depth = 1,
         hypernetwork_low_rank = 16,
         assoc_scan_kwargs: dict = dict(),
-        bidirectional_temporal_encoder_kwargs: dict = dict(
+        internal_sequence_embedder: Module | dict = dict(
             attn_dim_head = 32,
             heads = 8,
             depth = 2,
             polar_pos_emb = True
         ),
+        bidirectional = True,
         dim_sequence_summary_embed = 32, # the summary embedding from the bidirectional network needs to be bottlenecked
         action_proposer: Module | dict = dict(
             depth = 2,
@@ -271,7 +310,11 @@ class MetaController(Module):
 
         # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use bidirectional attention as placeholder
 
-        self.internal_sequence_embedder = Encoder(dim = dim_model, **bidirectional_temporal_encoder_kwargs)
+        if isinstance(internal_sequence_embedder, dict):
+            embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
+            internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
+
+        self.internal_sequence_embedder = internal_sequence_embedder
 
         self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
 
@@ -452,11 +495,7 @@ class MetaController(Module):
 
             encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask)
 
-            mean_pooled = masked_mean(encoded_residual_stream, mask, dim = 1)
-
-            summarized_sequence_embed = self.to_sequence_summary_embed(mean_pooled)
-
-            summarized_sequence_embed = repeat(summarized_sequence_embed, 'b d -> b n d', n = seq_len)
+            summarized_sequence_embed = self.to_sequence_summary_embed(encoded_residual_stream)
 
             # eq 15
 

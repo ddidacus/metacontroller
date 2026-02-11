@@ -31,7 +31,7 @@ from torch_einops_utils.save_load import save_load
 
 from vector_quantize_pytorch import BinaryMapper
 
-from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss
+from metacontroller.metacontroller import MetaControllerOutput, policy_loss, ratio_loss, BidirectionalSequenceEmbedder, CausalSequenceEmbedder
 
 # constants
 
@@ -167,12 +167,13 @@ class MetaControllerWithBinaryMapper(Module):
             polar_pos_emb = True
         ),
         assoc_scan_kwargs: dict = dict(),
-        bidirectional_temporal_encoder_kwargs: dict = dict(
+        internal_sequence_embedder: Module | dict = dict(
             attn_dim_head = 32,
             heads = 8,
             depth = 2,
             polar_pos_emb = True
         ),
+        bidirectional = True,
         action_proposer: Module | dict = dict(
             depth = 2,
             attn_dim_head = 32,
@@ -196,7 +197,11 @@ class MetaControllerWithBinaryMapper(Module):
 
         self.model_to_meta = Linear(dim_model, dim_meta)
 
-        self.internal_sequence_embedder = Encoder(dim = dim_model, **bidirectional_temporal_encoder_kwargs)
+        if isinstance(internal_sequence_embedder, dict):
+            embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
+            internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
+
+        self.internal_sequence_embedder = internal_sequence_embedder
 
         self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
 
@@ -389,11 +394,9 @@ class MetaControllerWithBinaryMapper(Module):
 
             encoded_temporal = self.internal_sequence_embedder(residual_stream, mask = mask)
 
-            mean_pooled = masked_mean(encoded_temporal, mask, dim = 1)
+            summarized_sequence_embed = self.to_sequence_summary_embed(encoded_temporal)
 
-            summarized_sequence_embed = self.to_sequence_summary_embed(mean_pooled)
-
-            summarized_sequence_embed = repeat(summarized_sequence_embed, 'b d -> b n d', n = seq_len)
+            summarized_sequence_embed = repeat(summarized_sequence_embed, 'b d -> b n d', n = seq_len) if summarized_sequence_embed.ndim == 2 else summarized_sequence_embed
 
             emitter_input = cat((
                 residual_stream,
