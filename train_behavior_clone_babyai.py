@@ -36,6 +36,7 @@ import wandb
 from metacontroller import MetaController, Transformer
 from metacontroller.transformer_with_resnet import TransformerWithResnet
 
+from torch.nn.parallel import DistributedDataParallel
 from babyai_env import get_mission_embedding
 
 import minigrid
@@ -146,8 +147,6 @@ def train(
     discovery_obs_loss_weight = 1e-3,
     discovery_kl_loss_weight = 0.05,
     discovery_ratio_loss_weight = 1.0,
-    discovery_switch_warmup_steps = 1,
-    discovery_switch_lr_scale = 0.1,
     max_grad_norm = 1.,
     use_resnet = False,
     condition_on_mission_embed = False,
@@ -168,14 +167,14 @@ def train(
             if not is_discovering:
                 unwrapped_model = accelerator.unwrap_model(model)
                 unwrapped_model.save(checkpoint_path_with_step)
+                accelerator.print(f"Model saved to {checkpoint_path_with_step}")
 
             if is_discovering:
                 unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
                 unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
+                accelerator.print(f"MetaController to {meta_controller_checkpoint_path_with_step}")
 
-            accelerator.print(f"Model saved to {checkpoint_path_with_step}, MetaController to {meta_controller_checkpoint_path_with_step}")
-
-
+            
     # check for yaml file
     
 
@@ -285,10 +284,7 @@ def train(
 
     optim_model = AdamW(model.parameters(), lr = lr, weight_decay = weight_decay)
 
-    optim_meta_controller = AdamW([
-        {"params": meta_controller.discovery_parameters_non_switching(), "lr": discovery_lr},
-        {"params": meta_controller.discovery_parameters_switching_unit(), "lr": 0.0},
-    ], weight_decay = discovery_weight_decay)
+    optim_meta_controller = AdamW(meta_controller.parameters(), lr = discovery_lr, weight_decay = discovery_weight_decay)
 
     # prepare
 
@@ -305,8 +301,13 @@ def train(
 
         is_discovering = (epoch >= cloning_epochs) # discovery phase is BC with metacontroller tuning
 
+
+
         if is_discovering:
-            model.train_discovery()
+            if isinstance(model, DistributedDataParallel):
+                model.module.train_discovery()
+            else:
+                model.train_discovery()
         else:
             model.train()
 
@@ -355,18 +356,12 @@ def train(
                         ratio_loss * discovery_ratio_loss_weight
                     )
 
-                    # LR warmup + permanent scale for switching unit: ramp to discovery_lr * scale over warmup, then stay there
-                    warmup_factor = min(1.0, (gradient_step + 1) / discovery_switch_warmup_steps)
-                    switch_lr = discovery_lr * discovery_switch_lr_scale * warmup_factor
-                    optim_meta_controller.param_groups[1]["lr"] = switch_lr
-
                     log = dict(
                         obs_loss = obs_loss.item(),
                         action_recon_loss = action_recon_loss.item(),
                         kl_loss = kl_loss.item(),
                         ratio_loss = ratio_loss.item(),
-                        switch_density = meta_controller_output.switch_beta.mean().item(),
-                        switch_lr_warmup = warmup_factor,
+                        switch_density = meta_controller_output.switch_beta.mean().item()
                     )
                 else:
                     state_loss, action_loss = losses
