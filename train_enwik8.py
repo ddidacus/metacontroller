@@ -28,6 +28,7 @@ from accelerate import Accelerator
 from einops import rearrange
 
 from metacontroller import MetaController, Transformer, binary_entropy
+from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
 # helpers
 
@@ -82,6 +83,7 @@ def sample(
     prompt: Tensor,
     seq_len: int,
     temperature = 1.,
+    meta_controller = None
 ):
     model.eval()
 
@@ -96,7 +98,8 @@ def sample(
         actions = action,
         return_cache = True,
         return_state_action_cache = True,
-        force_behavior_cloning = True
+        force_behavior_cloning = True,
+        meta_controller = meta_controller
     )
 
     next_action = next_state = model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
@@ -110,7 +113,8 @@ def sample(
             actions = state[:, -1:],
             cache = cache,
             return_state_action_cache = True,
-            force_behavior_cloning = True
+            force_behavior_cloning = True,
+            meta_controller = meta_controller
         )
 
         next_state = model.action_readout.sample(action_dist[:, -1:], temperature = temperature)
@@ -152,8 +156,8 @@ def train(
     discovery_state_loss_weight = 1.,
     discovery_action_loss_weight = 1.,
     discovery_kl_loss_weight = 0.1,
-    discovery_entropy_loss_weight = 0.75,
-    discovery_negative_entropy_loss_weight = 0.,
+    discovery_entropy_loss_weight = 0.1,
+    discovery_negative_entropy_loss_weight = 0.75,
     ratio_loss_weight = 1.0,
     validate_every = 100,
     generate_every = 250,
@@ -166,7 +170,12 @@ def train(
     depth = 3,
     heads = 8,
     attn_dim_head = 48,
+    hypernetwork_low_rank = 8,
     target_temporal_segment_len = 4,
+    use_binary_mapper = False,
+    dim_code_bits = 4,
+    kl_loss_threshold = 0.1,
+    switch_temperature = 0.1,
     discovery_phase = False,
     cpu = False,
     checkpoint_path = './results-enwik8/train-enwik8.pt',
@@ -201,9 +210,11 @@ CPU:                {cpu}
 Model Dim:          {dim}
 MC Dim:             {dim_meta_controller}
 Latent Dim:         {dim_latent}
+Binary Mapper:      {use_binary_mapper} (bits: {dim_code_bits} kl_thresh: {kl_loss_threshold} temp: {switch_temperature})
 Depth:              {depth}
 Heads:              {heads}
 Target Seg Len:     {target_temporal_segment_len}
+Hypernet Rank:      {hypernetwork_low_rank}
 Warmup Steps:       {discovery_warmup_steps}
 Checkpoint Path:    {checkpoint_path}
 {'='*50}
@@ -229,14 +240,27 @@ Checkpoint Path:    {checkpoint_path}
 
     # model
 
-    meta_controller = MetaController(
-        dim_model = dim,
-        dim_meta_controller = dim_meta_controller,
-        dim_latent = dim_latent,
-        target_temporal_segment_len = target_temporal_segment_len,
-        ratio_loss_weight = ratio_loss_weight,
-        ratio_loss_chunk_size = 8 * target_temporal_segment_len
-    )
+    if not use_binary_mapper:
+        meta_controller = MetaController(
+            dim_model = dim,
+            dim_meta_controller = dim_meta_controller,
+            dim_latent = dim_latent,
+            hypernetwork_low_rank = hypernetwork_low_rank,
+            target_temporal_segment_len = target_temporal_segment_len,
+            ratio_loss_weight = ratio_loss_weight,
+            ratio_loss_chunk_size = 8 * target_temporal_segment_len
+        )
+    else:
+        meta_controller = MetaControllerWithBinaryMapper(
+            dim_model = dim,
+            dim_meta_controller = dim_meta_controller,
+            dim_code_bits = dim_code_bits,
+            kl_loss_threshold = kl_loss_threshold,
+            switch_temperature = switch_temperature,
+            hypernetwork_low_rank = hypernetwork_low_rank,
+            target_temporal_segment_len = target_temporal_segment_len,
+            ratio_loss_weight = ratio_loss_weight
+        )
 
     model = Transformer(
         dim = dim,
@@ -244,7 +268,7 @@ Checkpoint Path:    {checkpoint_path}
         action_embed_readout = dict(num_discrete = 256),
         lower_body = dict(depth = depth, heads = heads, attn_dim_head = attn_dim_head),
         upper_body = dict(depth = depth, heads = heads, attn_dim_head = attn_dim_head),
-        meta_controller = meta_controller
+        meta_controller = None
     )
 
     # load checkpoint if it exists or if we are in discovery phase
@@ -252,7 +276,8 @@ Checkpoint Path:    {checkpoint_path}
     if discovery_phase or Path(checkpoint_path).exists():
         if Path(checkpoint_path).exists():
             accelerator.print(f"loading checkpoint from {checkpoint_path}")
-            model.load(checkpoint_path)
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.load(checkpoint_path, strict = False)
         elif discovery_phase:
             accelerator.print(f"warning: discovery phase requested but {checkpoint_path} not found. training from scratch.")
 
@@ -262,8 +287,8 @@ Checkpoint Path:    {checkpoint_path}
 
     discovery_optim = AdamW(meta_controller.discovery_parameters(), lr = discovery_learning_rate)
 
-    model, bc_optim, discovery_optim, train_loader, val_loader = accelerator.prepare(
-        model, bc_optim, discovery_optim, train_loader, val_loader
+    model, meta_controller, bc_optim, discovery_optim, train_loader, val_loader = accelerator.prepare(
+        model, meta_controller, bc_optim, discovery_optim, train_loader, val_loader
     )
 
     train_loader = cycle(train_loader)
@@ -281,7 +306,8 @@ Checkpoint Path:    {checkpoint_path}
             state_loss, action_loss = model(
                 state = state,
                 actions = actions,
-                force_behavior_cloning = True
+                force_behavior_cloning = True,
+                meta_controller = meta_controller
             )
 
             loss_val = state_loss + action_loss
@@ -294,7 +320,8 @@ Checkpoint Path:    {checkpoint_path}
                 actions = actions,
                 discovery_phase = True,
                 control_signal_multiplier = 0.0,
-                return_meta_controller_output = True
+                return_meta_controller_output = True,
+                meta_controller = meta_controller
             )
 
             state_recon_loss, action_recon_loss, _, _ = discovery_losses
@@ -310,7 +337,7 @@ Checkpoint Path:    {checkpoint_path}
         is_discovering = i >= num_bc_batches
 
         if is_discovering:
-            model.train_discovery(eval_rest = True)
+            model.train_discovery(eval_rest = True, meta_controller = meta_controller)
         else:
             model.train()
 
@@ -340,7 +367,8 @@ Checkpoint Path:    {checkpoint_path}
                 discovery_phase = is_discovering,
                 force_behavior_cloning = not is_discovering,
                 control_signal_multiplier = multiplier,
-                return_meta_controller_output = is_discovering
+                return_meta_controller_output = is_discovering,
+                meta_controller = meta_controller
             )
 
             if is_discovering:
@@ -415,7 +443,8 @@ Checkpoint Path:    {checkpoint_path}
                     actions = actions,
                     discovery_phase = is_discovering,
                     force_behavior_cloning = not is_discovering,
-                    return_meta_controller_output = is_discovering
+                    return_meta_controller_output = is_discovering,
+                    meta_controller = meta_controller
                 )
                 
                 if is_discovering:
@@ -438,13 +467,13 @@ Checkpoint Path:    {checkpoint_path}
             accelerator.print(f"\nPROMPT: {prime}")
 
             prompt = inp[None, ...]
-            sampled = sample(model, prompt, generate_length)
+            sampled = sample(model, prompt, generate_length, meta_controller = meta_controller)
             
             output = decode_tokens(sampled[0])
             accelerator.print(f"\nGENERATED: {output}\n")
 
         # save checkpoint at the end of BC phase
-        
+
         if i == (num_bc_batches - 1):
             accelerator.print(f"saving BC checkpoint to {checkpoint_path}")
             accelerator.wait_for_everyone()
@@ -455,10 +484,10 @@ Checkpoint Path:    {checkpoint_path}
 
     if total_steps > num_bc_batches:
         discovery_checkpoint_path = str(Path(checkpoint_path).with_stem(f"{Path(checkpoint_path).stem}-discovery"))
-        accelerator.print(f"saving discovery checkpoint to {discovery_checkpoint_path}")
+        accelerator.print(f"saving discovery checkpoint (metacontroller only) to {discovery_checkpoint_path}")
         accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save(discovery_checkpoint_path)
+        unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
+        unwrapped_meta_controller.save(discovery_checkpoint_path)
 
 if __name__ == '__main__':
     fire.Fire(train)
