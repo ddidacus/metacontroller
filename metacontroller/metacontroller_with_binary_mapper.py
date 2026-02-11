@@ -58,7 +58,7 @@ def log(t, eps = 1e-20):
 
 # meta controller classes
 
-@save_load
+@save_load()
 class GRUSwitchingUnit(Module):
     def __init__(
         self,
@@ -89,7 +89,7 @@ class GRUSwitchingUnit(Module):
         
         return beta, next_hidden
 
-@save_load
+@save_load()
 class QKSimilaritySwitchingUnit(Module):
     def __init__(
         self,
@@ -253,7 +253,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         # turn off the ratio loss by setting the weight to 0
 
-        assert 0. <= ratio_loss_weight <= 1.
+        assert ratio_loss_weight >= 0.
 
         self.has_ratio_loss = ratio_loss_weight > 0.
 

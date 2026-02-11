@@ -305,7 +305,7 @@ class MetaController(Module):
 
         # turn off the ratio loss by setting the weight to 0
 
-        assert 0. <= ratio_loss_weight <= 1.
+        assert ratio_loss_weight >= 0.
 
         self.has_ratio_loss = ratio_loss_weight > 0.
 
