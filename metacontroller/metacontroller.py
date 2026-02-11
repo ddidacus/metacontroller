@@ -360,11 +360,29 @@ class MetaController(Module):
         ]
 
     def train_internal_rl(self, eval_rest = False):
-        if eval_rest:
-            self.eval()
 
-        self.action_proposer.train()
-        self.action_proposer_mean_log_var.train()
+        # ensure RNNs and the module as a whole are in training mode
+        self.train()
+
+        # if eval_rest:
+        #     # freeze non-RL parts while keeping RNNs trainable for backward
+        #     # (summary_gru is used for RL, so we leave it in train mode)
+        #     for module_name in [
+        #         "internal_sequence_embedder",
+        #         "emitter",
+        #         "emitter_to_action_mean_log_var",
+        #         "switching_unit",
+        #         "to_switching_unit_beta",
+        #         "decoder",
+        #         "switch_gating",
+        #     ]:
+        #         module = getattr(self, module_name, None)
+        #         if module is not None:
+        #             module.eval()
+
+        # # RL-optimized components must always be in train mode
+        # self.action_proposer.train()
+        # self.action_proposer_mean_log_var.train()
 
     def get_action_dist_for_internal_rl(
         self,
@@ -782,7 +800,7 @@ class Transformer(Module):
             state, target_state = state, state[:, 1:]
 
             if self.state_loss_detach_target_state:
-                target_state = target_state.detach()
+                target_state = target_state.detach().clone()
 
             # actions
 
