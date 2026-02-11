@@ -396,8 +396,6 @@ class MetaControllerWithBinaryMapper(Module):
 
             summarized_sequence_embed = self.to_sequence_summary_embed(encoded_temporal)
 
-            summarized_sequence_embed = repeat(summarized_sequence_embed, 'b d -> b n d', n = seq_len) if summarized_sequence_embed.ndim == 2 else summarized_sequence_embed
-
             emitter_input = cat((
                 residual_stream,
                 meta_embed_prev,
