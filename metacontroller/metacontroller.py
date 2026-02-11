@@ -107,6 +107,44 @@ DiscoveryLosses = namedtuple('DiscoveryLosses', (
     'ratio'
 ))
 
+# meta controller classes
+
+@save_load()
+class BidirectionalSequenceEmbedder(Module):
+    def __init__(
+        self,
+        dim,
+        **kwargs
+    ):
+        super().__init__()
+        self.encoder = Encoder(dim = dim, **kwargs)
+
+    def forward(
+        self,
+        x,
+        mask = None
+    ):
+        encoded = self.encoder(x, mask = mask)
+        mean_pooled = masked_mean(encoded, mask, dim = 1)
+        return repeat(mean_pooled, 'b d -> b n d', n = x.shape[1])
+
+@save_load()
+class CausalSequenceEmbedder(Module):
+    def __init__(
+        self,
+        dim,
+        **kwargs
+    ):
+        super().__init__()
+        self.decoder = Decoder(dim = dim, **kwargs)
+
+    def forward(
+        self,
+        x,
+        mask = None
+    ):
+        return self.decoder(x, mask = mask)
+
 # meta controller
 
 MetaControllerOutput = namedtuple('MetaControllerOutput', (
@@ -186,15 +224,26 @@ def ratio_loss(
     switch_beta,                # float[b n]
     hard_switch_beta = None,    # bool[b n]
     episode_lens = None,        # int[b]
+    chunk_size = None
 ):
     # Hwang et al. https://arxiv.org/abs/2507.07955 eq (10)
+
+    seq_len = switch_beta.shape[-1]
+    mask = maybe(lens_to_mask)(episode_lens, seq_len)
 
     if not exists(hard_switch_beta):
         hard_switch_beta = switch_beta > 0.5
 
-    seq_len = switch_beta.shape[-1]
+    if exists(chunk_size):
+        num_chunks = seq_len // chunk_size
 
-    mask = maybe(lens_to_mask)(episode_lens, seq_len)
+        if num_chunks > 1:
+            chunk_limit = num_chunks * chunk_size
+            chunk_fn = lambda t: rearrange(t[:, :chunk_limit], 'b (k n) -> (b k) n', n = chunk_size)
+
+            switch_beta = chunk_fn(switch_beta)
+            hard_switch_beta = maybe(chunk_fn)(hard_switch_beta)
+            mask = maybe(chunk_fn)(mask)
 
     N = target_segment_len
     G = masked_mean(switch_beta, mask, dim = -1)
@@ -227,12 +276,14 @@ class MetaController(Module):
         decoder_depth = 1,
         hypernetwork_low_rank = 16,
         assoc_scan_kwargs: dict = dict(),
-        bidirectional_temporal_encoder_kwargs: dict = dict(
+        internal_sequence_embedder: Module | dict = dict(
             attn_dim_head = 32,
             heads = 8,
             depth = 2,
             polar_pos_emb = True
         ),
+        bidirectional = True,
+        dim_sequence_summary_embed = 32, # the summary embedding from the bidirectional network needs to be bottlenecked
         action_proposer: Module | dict = dict(
             depth = 2,
             attn_dim_head = 32,
@@ -242,6 +293,7 @@ class MetaController(Module):
         switch_temperature = 1.,
         target_temporal_segment_len = 4, # set to target segment length driven by ratio loss
         ratio_loss_weight = 1.,
+        ratio_loss_chunk_size = None,
         hard_switch = None
     ):
         super().__init__()
@@ -258,9 +310,15 @@ class MetaController(Module):
 
         # there are two phases, the first (discovery ssl phase) uses acausal with some ssm i don't really believe in - let's just use bidirectional attention as placeholder
 
-        self.internal_sequence_embedder = Encoder(dim = dim_model, **bidirectional_temporal_encoder_kwargs)
+        if isinstance(internal_sequence_embedder, dict):
+            embedder_klass = BidirectionalSequenceEmbedder if bidirectional else CausalSequenceEmbedder
+            internal_sequence_embedder = embedder_klass(dim = dim_model, **internal_sequence_embedder)
 
-        self.emitter = GRU(dim_meta + dim_model * 2, dim_meta * 2)
+        self.internal_sequence_embedder = internal_sequence_embedder
+
+        self.to_sequence_summary_embed = Linear(dim_model, dim_sequence_summary_embed)
+
+        self.emitter = GRU(dim_meta + dim_model + dim_sequence_summary_embed, dim_meta * 2)
 
         self.emitter_to_action_mean_log_var = Readout(dim_meta * 2, num_continuous = dim_latent)
 
@@ -268,13 +326,13 @@ class MetaController(Module):
             # default to Decoder, wrapped for standard interface
 
             action_proposer = ActionProposerWrapper(
-                Decoder(dim = dim_meta, **action_proposer),
+                Decoder(dim = dim_model, **action_proposer),
                 cache_key = 'cache',
                 return_cache_key = 'return_hiddens'
             )
 
         self.action_proposer = action_proposer
-        self.action_proposer_mean_log_var = Readout(dim_meta, num_continuous = dim_latent)
+        self.action_proposer_mean_log_var = Readout(dim_model, num_continuous = dim_latent)
 
         # switching unit
 
@@ -290,11 +348,12 @@ class MetaController(Module):
 
         # turn off the ratio loss by setting the weight to 0
 
-        assert 0. <= ratio_loss_weight <= 1.
+        assert ratio_loss_weight >= 0.
 
         self.has_ratio_loss = ratio_loss_weight > 0.
 
         self.ratio_loss_weight = ratio_loss_weight
+        self.ratio_loss_chunk_size = ratio_loss_chunk_size
         self.target_temporal_segment_len = target_temporal_segment_len
 
         # decoder
@@ -328,6 +387,7 @@ class MetaController(Module):
             *self.summary_gru.parameters(),
             *self.model_to_meta.parameters(),
             *self.internal_sequence_embedder.parameters(),
+            *self.to_sequence_summary_embed.parameters(),
             *self.emitter.parameters(),
             *self.emitter_to_action_mean_log_var.parameters(),
             *self.switching_unit.parameters(),
@@ -347,6 +407,7 @@ class MetaController(Module):
             *self.summary_gru.parameters(),
             *self.model_to_meta.parameters(),
             *self.internal_sequence_embedder.parameters(),
+            *self.to_sequence_summary_embed.parameters(),
             *self.emitter.parameters(),
             *self.emitter_to_action_mean_log_var.parameters(),
             *self.decoder.parameters(),
@@ -388,11 +449,8 @@ class MetaController(Module):
         self,
         residual_stream
     ):
-        summarized, _ = self.summary_gru(residual_stream)
 
-        meta_embed = self.model_to_meta(summarized)
-
-        proposed_action_hidden, _ = self.action_proposer(meta_embed)
+        proposed_action_hidden, _ = self.action_proposer(residual_stream)
 
         return self.action_proposer_mean_log_var(proposed_action_hidden)
 
@@ -455,9 +513,7 @@ class MetaController(Module):
 
             encoded_residual_stream = self.internal_sequence_embedder(residual_stream, mask = mask)
 
-            summarized_sequence_embed = masked_mean(encoded_residual_stream, mask, dim = 1)
-
-            summarized_sequence_embed = repeat(summarized_sequence_embed, 'b d -> b n d', n = seq_len)
+            summarized_sequence_embed = self.to_sequence_summary_embed(encoded_residual_stream)
 
             # eq 15
 
@@ -474,7 +530,7 @@ class MetaController(Module):
         else: # else internal rl phase
 
             proposed_action_hidden, next_action_proposer_hidden = self.action_proposer(
-                meta_embed,
+                residual_stream,
                 cache = prev_action_proposer_hidden
             )
 
@@ -578,7 +634,8 @@ class MetaController(Module):
             aux_ratio_loss = self.ratio_loss(
                 self.target_temporal_segment_len,
                 switch_beta,
-                episode_lens = episode_lens
+                episode_lens = episode_lens,
+                chunk_size = self.ratio_loss_chunk_size
             )
 
             aux_ratio_loss = aux_ratio_loss * self.ratio_loss_weight
@@ -752,7 +809,8 @@ class Transformer(Module):
         return_action_logits = False,
         condition = None,
         return_embed = False,
-        control_signal_multiplier = 1.
+        control_signal_multiplier = 1.,
+        use_hard_switch = False
     ):
         device = state.device
 
@@ -854,7 +912,14 @@ class Transformer(Module):
 
             if exists(meta_controller) and not behavioral_cloning:
                 meta_cache = None if discovery_phase else meta_hiddens
-                control_signal, next_meta_hiddens = meta_controller(residual_stream, cache = meta_cache, discovery_phase = discovery_phase, temperature = meta_controller_temperature, episode_lens = episode_lens)
+                control_signal, next_meta_hiddens = meta_controller(
+                    residual_stream, 
+                    cache = meta_cache, 
+                    discovery_phase = discovery_phase, 
+                    temperature = meta_controller_temperature, 
+                    episode_lens = episode_lens,
+                    hard_switch = use_hard_switch
+                )
             else:
                 control_signal, next_meta_hiddens = self.zero, None
 

@@ -33,8 +33,9 @@ from einops import rearrange
 import matplotlib.pyplot as plt
 import wandb
 
-from metacontroller import MetaController, Transformer
+from metacontroller import MetaController, Transformer, binary_entropy
 from metacontroller.transformer_with_resnet import TransformerWithResnet
+from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 
 from torch.nn.parallel import DistributedDataParallel
 from babyai_env import get_mission_embedding
@@ -140,17 +141,32 @@ def train(
     meta_controller_checkpoint_path = "meta_controller_discovery.pt",
     load_transformer_weights_path = None,
     load_meta_controller_weights_path = None,
+    use_hard_switch = False,
     save_steps = 1000,
+    eval_steps = 1000,
     state_loss_weight = 1.,
     action_loss_weight = 1.,
     discovery_action_recon_loss_weight = 1.,
     discovery_obs_loss_weight = 1e-3,
     discovery_kl_loss_weight = 0.05,
+    discovery_entropy_loss_weight = 0.1,
+    discovery_negative_entropy_loss_weight = 0.75,
     discovery_ratio_loss_weight = 1.0,
     max_grad_norm = 1.,
     use_resnet = False,
     condition_on_mission_embed = False,
-    mission_embed_dim = 384
+    mission_embed_dim = 384,
+    use_binary_mapper = False,
+    dim_meta_controller = 128,
+    dim_code_bits = 4,
+    switching_unit_type = 'qk',
+    dim_queries_keys = 256,
+    boundary_threshold = 0.5,
+    switching_unit_decoder_heads = 8,
+    switching_unit_decoder_attn_dim_head = 64,
+    kl_loss_threshold = 0.1,
+    hypernetwork_low_rank = 8,
+    target_temporal_segment_len = 4
 ):
 
     def store_checkpoint(step:int = None, is_discovering: bool = False):
@@ -201,7 +217,17 @@ def train(
                 "env_id": env_id,
                 "state_loss_weight": state_loss_weight,
                 "action_loss_weight": action_loss_weight,
-                "discovery_ratio_loss_weight": discovery_ratio_loss_weight
+                "discovery_ratio_loss_weight": discovery_ratio_loss_weight,
+                "use_binary_mapper": use_binary_mapper,
+                "dim_meta_controller": dim_meta_controller if use_binary_mapper else None,
+                "dim_code_bits": dim_code_bits if use_binary_mapper else None,
+                "switching_unit_type": switching_unit_type if use_binary_mapper else None,
+                "dim_queries_keys": dim_queries_keys if use_binary_mapper else None,
+                "boundary_threshold": boundary_threshold if use_binary_mapper else None,
+                "kl_loss_threshold": kl_loss_threshold if use_binary_mapper else None,
+                "switch_temperature": switch_temperature,
+                "hypernetwork_low_rank": hypernetwork_low_rank if use_binary_mapper else None,
+                "target_temporal_segment_len": target_temporal_segment_len if use_binary_mapper else None
             }
         )
 
@@ -231,7 +257,27 @@ def train(
 
     # meta controller
 
-    meta_controller = MetaController(dim, switch_temperature = switch_temperature, ratio_loss_weight = discovery_ratio_loss_weight)
+    if not use_binary_mapper:
+        meta_controller = MetaController(dim, switch_temperature = switch_temperature, ratio_loss_weight = discovery_ratio_loss_weight)
+    else:
+        meta_controller = MetaControllerWithBinaryMapper(
+            dim_model = dim,
+            dim_meta_controller = dim_meta_controller,
+            dim_code_bits = dim_code_bits,
+            switching_unit_type = switching_unit_type,
+            dim_queries_keys = dim_queries_keys,
+            boundary_threshold = boundary_threshold,
+            switching_unit_decoder_kwargs = dict(
+                heads = switching_unit_decoder_heads,
+                attn_dim_head = switching_unit_decoder_attn_dim_head,
+                polar_pos_emb = True
+            ),
+            kl_loss_threshold = kl_loss_threshold,
+            switch_temperature = switch_temperature,
+            hypernetwork_low_rank = hypernetwork_low_rank,
+            target_temporal_segment_len = target_temporal_segment_len,
+            ratio_loss_weight = discovery_ratio_loss_weight
+        )
 
     # transformer
     
@@ -284,7 +330,7 @@ def train(
 
     optim_model = AdamW(model.parameters(), lr = lr, weight_decay = weight_decay)
 
-    optim_meta_controller = AdamW(meta_controller.parameters(), lr = discovery_lr, weight_decay = discovery_weight_decay)
+    optim_meta_controller = AdamW(meta_controller.discovery_parameters(), lr = discovery_lr, weight_decay = discovery_weight_decay)
 
     # prepare
 
@@ -301,8 +347,6 @@ def train(
 
         is_discovering = (epoch >= cloning_epochs) # discovery phase is BC with metacontroller tuning
 
-
-
         if is_discovering:
             if isinstance(model, DistributedDataParallel):
                 model.module.train_discovery()
@@ -315,10 +359,7 @@ def train(
 
         for batch in progress_bar:
             
-            # batch is a NamedTuple (e.g. MemoryMappedBatch)
-            # state: (B, T, 7, 7, 3), action: (B, T)
-            # normalize inputs to be first in [0, 1] by dividing by 255
-            # then normalize w.r.t. mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]
+            # RGB normalization
             states = batch['state'].float()
             states = torch.clamp(states / 255.0, min=0.0, max=1.0)
             states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
@@ -343,16 +384,32 @@ def train(
                     discovery_phase = is_discovering,
                     force_behavior_cloning = not is_discovering,
                     return_meta_controller_output = True,
-                    condition = mission_embeddings
+                    condition = mission_embeddings,
+                    use_hard_switch = use_hard_switch
                 )
 
                 if is_discovering:
                     obs_loss, action_recon_loss, kl_loss, ratio_loss = losses
 
+                    entropy_loss = binary_entropy(meta_controller_output.switch_beta).mean()
+
+                    # dynamic entropy weight
+                    # if density is 0, apply negative entropy weight to push switch betas towards 0.5
+                    
+                    last_hard_switch_density = (meta_controller_output.switch_beta > 0.5).float().mean().item()
+
+                    # minimize entropy (push to the edges)
+                    entropy_weight = discovery_entropy_loss_weight
+
+                    # maximize entropy if beta hits zero
+                    if last_hard_switch_density == 0:
+                        entropy_weight = -discovery_negative_entropy_loss_weight
+
                     loss = (
                         obs_loss * discovery_obs_loss_weight + 
                         action_recon_loss * discovery_action_recon_loss_weight +
                         kl_loss * discovery_kl_loss_weight +
+                        entropy_loss * entropy_weight +
                         ratio_loss * discovery_ratio_loss_weight
                     )
 
@@ -360,8 +417,9 @@ def train(
                         obs_loss = obs_loss.item(),
                         action_recon_loss = action_recon_loss.item(),
                         kl_loss = kl_loss.item(),
+                        entropy_loss = entropy_loss.item(),
                         ratio_loss = ratio_loss.item(),
-                        switch_density = meta_controller_output.switch_beta.mean().item()
+                        hard_switch_density = last_hard_switch_density,
                     )
                 else:
                     state_loss, action_loss = losses
@@ -417,6 +475,7 @@ def train(
                 accelerator.wait_for_everyone()
                 store_checkpoint(gradient_step, is_discovering)
 
+            if gradient_step % eval_steps == 10:
                 # visualize switch betas during discovery phase
                 if is_discovering and use_wandb and accelerator.is_main_process:
                     visualize_switch_betas(
