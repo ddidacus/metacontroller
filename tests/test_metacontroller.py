@@ -36,6 +36,8 @@ def test_metacontroller(
     use_mingru,
     accept_condition
 ):
+    dim_model = 512
+    dim_meta = 256
 
     state = torch.randn(2, 128, 384)
     episode_lens = torch.tensor([64, 64]) if variable_length else None
@@ -64,7 +66,7 @@ def test_metacontroller(
     # behavioral cloning phase
 
     model = Transformer(
-        dim = 512,
+        dim = dim_model,
         action_embed_readout = action_embed_readout,
         state_embed_readout = dict(num_continuous = 384),
         lower_body = dict(depth = 2,),
@@ -78,14 +80,12 @@ def test_metacontroller(
 
     # discovery and internal rl phase with meta controller
 
-    dim_meta = 256
-
     action_proposer_kwargs = dict()
 
     if use_mingru:
         action_proposer_kwargs = dict(
             action_proposer = ActionProposerWrapper(
-                minGRU(dim = dim_meta),
+                minGRU(dim = dim_model),
                 cache_key = 'prev_hidden',
                 return_cache_key = 'return_next_prev_hidden'
             )
@@ -93,14 +93,14 @@ def test_metacontroller(
 
     if not use_binary_mapper_variant:
         meta_controller = MetaController(
-            dim_model = 512,
+            dim_model = dim_model,
             dim_meta_controller = dim_meta,
             dim_latent = 128,
             **action_proposer_kwargs
         )
     else:
         meta_controller = MetaControllerWithBinaryMapper(
-            dim_model = 512,
+            dim_model = dim_model,
             dim_meta_controller = dim_meta,
             dim_code_bits = 8,
             **action_proposer_kwargs
