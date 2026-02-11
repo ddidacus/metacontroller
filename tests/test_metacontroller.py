@@ -22,20 +22,26 @@ def exists(v):
 
 # test
 
-@param('use_binary_mapper_variant', (False, True))
 @param('accept_condition', (False, True))
 @param('action_discrete', (False, True))
 @param('embed_past_actions', (False, True))
 @param('variable_length', (False, True))
 @param('use_mingru', (False, True))
+@param('variant', [
+    (False, 'qk'),
+    (False, 'gru'),
+    (True, 'qk'),
+    (True, 'gru')
+])
 def test_metacontroller(
-    use_binary_mapper_variant,
+    variant,
     action_discrete,
     embed_past_actions,
     variable_length,
     use_mingru,
-    accept_condition
+    accept_condition,
 ):
+    use_binary_mapper_variant, switching_unit_type = variant
     dim_model = 512
     dim_meta = 256
 
@@ -103,6 +109,7 @@ def test_metacontroller(
             dim_model = dim_model,
             dim_meta_controller = dim_meta,
             dim_code_bits = 8,
+            switching_unit_type = switching_unit_type,
             **action_proposer_kwargs
         )
 
@@ -121,6 +128,7 @@ def test_metacontroller(
         test_folder,
         max_episodes = 3,
         max_timesteps = 256,
+        circular = True,
         fields = meta_controller.replay_buffer_field_dict,
         meta_fields = dict(
             advantages = 'float'

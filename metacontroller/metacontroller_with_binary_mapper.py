@@ -9,18 +9,19 @@ from loguru import logger
 
 import torch
 from torch import nn, cat, stack, tensor, Tensor
-from torch.nn import Module, GRU, Linear, Identity
+from torch.nn import Module, GRU, Linear, Identity, Parameter
 import torch.nn.functional as F
+from torch.nn.functional import cosine_similarity, sigmoid
 
 # einops
 
 import einx
-from einops import einsum, rearrange, repeat, reduce
+from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
 
 # external modules
 
-from x_transformers import Encoder, Decoder
+from x_transformers import Encoder, Decoder, Attention
 from x_mlps_pytorch import Feedforwards
 
 from assoc_scan import AssocScan
@@ -55,7 +56,94 @@ def straight_through(src, tgt):
 def log(t, eps = 1e-20):
     return t.clamp_min(eps).log()
 
-# meta controller
+# meta controller classes
+
+class GRUSwitchingUnit(Module):
+    def __init__(
+        self,
+        dim_model,
+        dim_meta,
+        num_codes,
+        switch_temperature = 0.1
+    ):
+        super().__init__()
+        self.gru = GRU(dim_model + dim_meta + num_codes, dim_meta)
+        self.to_beta = Linear(dim_meta, 1, bias = False)
+        self.switch_temperature = switch_temperature
+
+    def forward(
+        self,
+        residual_stream,
+        meta_embed_prev,
+        sampled_codes_prev,
+        prev_hidden = None
+    ):
+        switch_input = cat((residual_stream, meta_embed_prev, sampled_codes_prev), dim = -1)
+        
+        gru_out, next_hidden = self.gru(switch_input, prev_hidden)
+        
+        beta_logit = self.to_beta(gru_out)
+        beta = (beta_logit / self.switch_temperature).sigmoid()
+        beta = rearrange(beta, '... 1 -> ...')
+        
+        return beta, next_hidden
+
+class QKSimilaritySwitchingUnit(Module):
+    def __init__(
+        self,
+        dim_model,
+        dim_queries_keys = 256,
+        boundary_threshold = 0.5,
+        decoder_kwargs: dict = dict(
+            heads = 8,
+            attn_dim_head = 64,
+            polar_pos_emb = True
+        )
+    ):
+        super().__init__()
+        self.decoder = Decoder(
+            dim = dim_model,
+            depth = 1,
+            **decoder_kwargs
+        )
+
+        self.to_queries_keys = Linear(dim_model, dim_queries_keys * 2, bias = False)
+        self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2)
+        self.boundary_threshold = boundary_threshold
+
+    def forward(
+        self,
+        residual_stream,
+        cache = None
+    ):
+        # apply decoder first
+
+        decoder_cache = None
+        prev_key = None
+
+        if exists(cache):
+            decoder_cache, prev_key = cache
+
+        # decoder from x-transformers
+
+        decoded, next_decoder_cache = self.decoder(
+            residual_stream,
+            cache = decoder_cache,
+            return_hiddens = True
+        )
+
+        queries, keys = self.to_queries_keys(decoded).chunk(2, dim = -1)
+        batch = queries.shape[0]
+
+        if not exists(prev_key):
+            prev_key = repeat(self.start_key_token, 'd -> b 1 d', b = batch)
+
+        keys_with_prev = cat((prev_key, keys), dim = 1)
+        cosine_sim = cosine_similarity(queries, keys_with_prev[:, :-1], dim = -1)
+        
+        beta = (1. - cosine_sim) * 0.5
+        
+        return beta, (next_decoder_cache, keys[:, -1:])
 
 @save_load()
 class MetaControllerWithBinaryMapper(Module):
@@ -68,6 +156,14 @@ class MetaControllerWithBinaryMapper(Module):
         decoder_expansion_factor = 2.,
         decoder_depth = 1,
         hypernetwork_low_rank = 16,
+        switching_unit_type = 'qk', # 'qk' or 'gru'
+        dim_queries_keys = 256,
+        boundary_threshold = 0.5,
+        switching_unit_decoder_kwargs: dict = dict(
+            heads = 8,
+            attn_dim_head = 64,
+            polar_pos_emb = True
+        ),
         assoc_scan_kwargs: dict = dict(),
         bidirectional_temporal_encoder_kwargs: dict = dict(
             attn_dim_head = 32,
@@ -131,9 +227,23 @@ class MetaControllerWithBinaryMapper(Module):
 
         # switching unit
 
-        self.switching_unit = GRU(dim_model + dim_meta + self.num_codes, dim_meta)
+        assert switching_unit_type in {'qk', 'gru'}
+        self.switching_unit_type = switching_unit_type
 
-        self.to_switching_unit_beta = nn.Linear(dim_meta, 1, bias = False)
+        if switching_unit_type == 'qk':
+            self.switching_unit = QKSimilaritySwitchingUnit(
+                dim_model = dim_model,
+                dim_queries_keys = dim_queries_keys,
+                boundary_threshold = boundary_threshold,
+                decoder_kwargs = switching_unit_decoder_kwargs
+            )
+        else:
+            self.switching_unit = GRUSwitchingUnit(
+                dim_model = dim_model,
+                dim_meta = dim_meta_controller,
+                num_codes = self.num_codes,
+                switch_temperature = switch_temperature
+            )
 
         self.switch_temperature = switch_temperature
 
@@ -184,7 +294,6 @@ class MetaControllerWithBinaryMapper(Module):
             *self.emitter_to_binary_logits.parameters(),
             *self.binary_mapper.parameters(),
             *self.switching_unit.parameters(),
-            *self.to_switching_unit_beta.parameters(),
             *self.decoder.parameters(),
             *self.switch_gating.parameters()
         ]
@@ -243,7 +352,7 @@ class MetaControllerWithBinaryMapper(Module):
 
         # destruct prev cache
 
-        prev_summarized, prev_action_proposer_hidden, prev_switching_unit_gru_hidden, prev_switch_gated_hiddens, prev_sampled_code = cache.prev_hiddens if exists(cache) else ((None,) * 5)
+        prev_summarized, prev_action_proposer_hidden, prev_key, prev_switch_gated_hiddens, prev_sampled_code = cache.prev_hiddens if exists(cache) else ((None,) * 5)
 
         # getting proposed action for the two phases
 
@@ -318,29 +427,29 @@ class MetaControllerWithBinaryMapper(Module):
 
         # switching unit timer
 
-        batch, seq_len, dim = sampled_codes.shape
-
-        if not exists(prev_sampled_code):
-            prev_sampled_code = torch.zeros(batch, 1, self.num_codes, device = device)
-
-        if discovery_phase:
-            z_prev = cat((prev_sampled_code, sampled_codes[:, :-1]), dim = 1)
+        if self.switching_unit_type == 'qk':
+            switch_beta, next_switching_unit_hidden = self.switching_unit(
+                residual_stream,
+                prev_key
+            )
         else:
-            assert seq_len == 1, 'inference RL phase must be done one token at a time - if replaying for policy optimization, please use `get_action_dist_for_internal_rl`'
-            z_prev = prev_sampled_code
+            batch, seq_len, _ = sampled_codes.shape
 
-        switch_input = torch.cat((residual_stream, meta_embed_prev, z_prev), dim=-1)
+            if not exists(prev_sampled_code):
+                prev_sampled_code = torch.zeros(batch, 1, self.num_codes, device = device)
 
-        switching_unit_gru_out, next_switching_unit_gru_hidden = self.switching_unit(
-            switch_input, 
-            prev_switching_unit_gru_hidden
-        )
+            if discovery_phase:
+                z_prev = cat((prev_sampled_code, sampled_codes[:, :-1]), dim = 1)
+            else:
+                assert seq_len == 1
+                z_prev = prev_sampled_code
 
-        switch_beta_logit = self.to_switching_unit_beta(switching_unit_gru_out)
-
-        switch_beta = (switch_beta_logit / self.switch_temperature).sigmoid()
-
-        switch_beta = rearrange(switch_beta, '... 1 -> ...')
+            switch_beta, next_switching_unit_hidden = self.switching_unit(
+                residual_stream,
+                meta_embed_prev,
+                z_prev,
+                prev_key # overloading prev_key as gru hidden for the sake of the tuple
+            )
 
         # losses
 
@@ -400,7 +509,7 @@ class MetaControllerWithBinaryMapper(Module):
         next_hiddens = (
             next_summarized,
             next_action_proposer_hidden,
-            next_switching_unit_gru_hidden,
+            next_switching_unit_hidden,
             next_switch_gated_codes,
             sampled_codes[:, -1:]
         )

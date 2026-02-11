@@ -174,6 +174,11 @@ def train(
     target_temporal_segment_len = 4,
     use_binary_mapper = False,
     dim_code_bits = 4,
+    switching_unit_type = 'qk',
+    dim_queries_keys = 256,
+    boundary_threshold = 0.5,
+    switching_unit_decoder_heads = 8,
+    switching_unit_decoder_attn_dim_head = 64,
     kl_loss_threshold = 0.1,
     switch_temperature = 0.1,
     discovery_phase = False,
@@ -210,7 +215,7 @@ CPU:                {cpu}
 Model Dim:          {dim}
 MC Dim:             {dim_meta_controller}
 Latent Dim:         {dim_latent}
-Binary Mapper:      {use_binary_mapper} (bits: {dim_code_bits} kl_thresh: {kl_loss_threshold} temp: {switch_temperature})
+Binary Mapper:      True (bits: {dim_code_bits} type: {switching_unit_type} qk_dim: {dim_queries_keys} thresh: {boundary_threshold} kl_thresh: {kl_loss_threshold} temp: {switch_temperature})
 Depth:              {depth}
 Heads:              {heads}
 Target Seg Len:     {target_temporal_segment_len}
@@ -255,6 +260,14 @@ Checkpoint Path:    {checkpoint_path}
             dim_model = dim,
             dim_meta_controller = dim_meta_controller,
             dim_code_bits = dim_code_bits,
+            switching_unit_type = switching_unit_type,
+            dim_queries_keys = dim_queries_keys,
+            boundary_threshold = boundary_threshold,
+            switching_unit_decoder_kwargs = dict(
+                heads = switching_unit_decoder_heads,
+                attn_dim_head = switching_unit_decoder_attn_dim_head,
+                polar_pos_emb = True
+            ),
             kl_loss_threshold = kl_loss_threshold,
             switch_temperature = switch_temperature,
             hypernetwork_low_rank = hypernetwork_low_rank,
