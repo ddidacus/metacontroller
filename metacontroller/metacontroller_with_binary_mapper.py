@@ -58,6 +58,7 @@ def log(t, eps = 1e-20):
 
 # meta controller classes
 
+@save_load
 class GRUSwitchingUnit(Module):
     def __init__(
         self,
@@ -88,6 +89,7 @@ class GRUSwitchingUnit(Module):
         
         return beta, next_hidden
 
+@save_load
 class QKSimilaritySwitchingUnit(Module):
     def __init__(
         self,
