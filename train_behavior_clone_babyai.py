@@ -22,6 +22,8 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+from torch.nn import init
+import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
@@ -45,8 +47,13 @@ import gymnasium as gym
 
 # helpers
 
-from torch.nn import init
-import torch.nn as nn
+def symlog(x):
+    """Applies symmetric log transformation."""
+    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
+def set_requires_grad(network: nn.Module, grad_val: bool):
+    for param in network.parameters():
+        param.requires_grad = grad_val
 
 def initialize_weights_xavier(module):
     if isinstance(module, nn.Linear):
@@ -67,6 +74,10 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+
+def lens_to_mask(lens, seq_len, device):
+    """Boolean mask (B, seq_len): True where t < lens[b]."""
+    return torch.arange(seq_len, device=device, dtype=lens.dtype).unsqueeze(0) < lens.unsqueeze(1)
 
 def visualize_switch_betas(
     switch_betas,      # (B, T-1)
@@ -293,6 +304,7 @@ def train(
         dim_condition = mission_embed_dim if condition_on_mission_embed else None
     )
     if use_resnet: transformer_kwargs["use_layernorm"] = True # resnet won't suffer from grad. accum.
+    
 
     model = transformer_class(**transformer_kwargs)
 
@@ -338,6 +350,9 @@ def train(
 
     # training
 
+    old_discovery_obs_loss_weight = discovery_obs_loss_weight
+    old_discovery_action_recon_loss_weight = discovery_action_recon_loss_weight 
+
     gradient_step = 0
     for epoch in range(cloning_epochs + discovery_epochs):
 
@@ -347,22 +362,48 @@ def train(
 
         is_discovering = (epoch >= cloning_epochs) # discovery phase is BC with metacontroller tuning
 
-        if is_discovering:
-            if isinstance(model, DistributedDataParallel):
-                model.module.train_discovery()
-            else:
-                model.train_discovery()
+        # if is_discovering:
+        #     if isinstance(model, DistributedDataParallel):
+        #         model.module.train_discovery()
+        #     else:
+        #         model.train_discovery()
+        # else:
+        #     model.train()
+
+        if is_discovering: 
+            # freeze transformer
+            if isinstance(model, DistributedDataParallel): set_requires_grad(model.module, False)
+            else: set_requires_grad(model, False)
+
+            # enable meta controller
+            if isinstance(meta_controller, DistributedDataParallel): set_requires_grad(meta_controller.module, True)
+            else: set_requires_grad(meta_controller, True)
+
         else:
-            model.train()
+            # enable transformer
+            if isinstance(model, DistributedDataParallel): set_requires_grad(model.module, True)
+            else: set_requires_grad(model, True)
+
+            # freeze meta controller
+            if isinstance(meta_controller, DistributedDataParallel): set_requires_grad(meta_controller.module, False)
+            else: set_requires_grad(meta_controller, False)
 
         optim = optim_model if not is_discovering else optim_meta_controller
 
         for batch in progress_bar:
             
             # RGB normalization
-            states = batch['state'].float()
-            states = torch.clamp(states / 255.0, min=0.0, max=1.0)
-            states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
+            if use_resnet:
+                states = batch['state'].float()
+                states = torch.clamp(states / 255.0, min=0.0, max=1.0)
+                states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
+            
+            # Symbolic obs values
+            else:
+                states = batch['state'].float()
+                # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
+                states = rearrange(states, 'b t ... -> b t (...)')
+                # states = symlog(states.float())
 
             actions = batch['action'].long()
             episode_lens = batch.get('_lens')
@@ -373,10 +414,8 @@ def train(
             else:
                 mission_embeddings = None
 
-            # flatten state: (B, T, 7, 7, 3) -> (B, T, 147)
-            if not use_resnet: states = rearrange(states, 'b t ... -> b t (...)')
-
             with accelerator.accumulate(model):
+                
                 losses, meta_controller_output = model(
                     state=states,
                     actions=actions,
@@ -389,21 +428,38 @@ def train(
                 )
 
                 if is_discovering:
+                    
                     obs_loss, action_recon_loss, kl_loss, ratio_loss = losses
 
-                    entropy_loss = binary_entropy(meta_controller_output.switch_beta).mean()
+                    # Mask for valid (non-padded) switch positions: for episode length L we have L-1 transitions.
+                    # Density and entropy must use this mask so they match what we visualize (valid only).
+                    # Otherwise padding positions dominate and density can be ~0.6 while real trajectory is all zeros.
+                    switch_beta = meta_controller_output.switch_beta
+                    _, T_minus_1 = switch_beta.shape
+                    if exists(episode_lens):
+                        lens = episode_lens.to(switch_beta.device)
+                        valid_switch_len = (lens - 1).clamp(min=0)
+                        switch_mask = lens_to_mask(valid_switch_len, T_minus_1, switch_beta.device)
+                        n_valid = switch_mask.sum().clamp(min=1)
+                        entropy_loss = (binary_entropy(switch_beta) * switch_mask).sum() / n_valid
+                        last_hard_switch_density = ((switch_beta > 0.5).float() * switch_mask).sum().item() / n_valid.item()
+                        last_soft_switch_density = (switch_beta * switch_mask).sum().item() / n_valid.item()
+                    else:
+                        entropy_loss = binary_entropy(switch_beta).mean()
+                        last_hard_switch_density = (switch_beta > 0.5).float().mean().item()
+                        last_soft_switch_density = switch_beta.mean().item()
 
-                    # dynamic entropy weight
-                    # if density is 0, apply negative entropy weight to push switch betas towards 0.5
-                    
-                    last_hard_switch_density = (meta_controller_output.switch_beta > 0.5).float().mean().item()
-
-                    # minimize entropy (push to the edges)
-                    entropy_weight = discovery_entropy_loss_weight
-
-                    # maximize entropy if beta hits zero
-                    if last_hard_switch_density == 0:
+                    # zero betas -> feasibility restoration -> losses: (entropy, kl)
+                    if last_hard_switch_density < 0.1:
                         entropy_weight = -discovery_negative_entropy_loss_weight
+                        discovery_obs_loss_weight = 0
+                        discovery_action_recon_loss_weight = 0
+                    
+                    # otherwise losses: (obs, action, kl)
+                    else:
+                        entropy_weight = discovery_entropy_loss_weight
+                        discovery_obs_loss_weight = old_discovery_obs_loss_weight
+                        discovery_action_recon_loss_weight = old_discovery_action_recon_loss_weight
 
                     loss = (
                         obs_loss * discovery_obs_loss_weight + 
@@ -420,6 +476,7 @@ def train(
                         entropy_loss = entropy_loss.item(),
                         ratio_loss = ratio_loss.item(),
                         hard_switch_density = last_hard_switch_density,
+                        soft_switch_density = last_soft_switch_density,
                     )
                 else:
                     state_loss, action_loss = losses

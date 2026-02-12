@@ -560,8 +560,11 @@ class MetaController(Module):
             assert seq_len == 1, 'inference RL phase must be done one token at a time - if replaying for policy optimization, please use `get_action_dist_for_internal_rl`'
             z_prev = prev_sampled_latent_action
 
-        # switch input is previous latent action and the embedding
-        # eq (16)
+        # eq (16): β_t = f_switch(e_t, h_{t-1}, z_{t-1}) ∈ [0, 1]
+        # switch_input = [e_t, h_{t-1}, z_{t-1}]:
+        #   e_t       = residual_stream (current observation/embedding)
+        #   h_{t-1}  = meta_embed_prev (summary GRU output at t-1; switching unit GRU also gets prev_switching_unit_gru_hidden)
+        #   z_{t-1}  = z_prev (previous latent code)
 
         switch_input = cat((
             residual_stream,

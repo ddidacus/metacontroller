@@ -194,7 +194,7 @@ class BabyAIBotEpsilonGreedy:
 
 # functions
 
-def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_shape, num_actions=None):
+def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_shape, num_actions=None, use_rgb_states = True):
     """
     Collect a single episode of demonstrations.
     Returns tuple of (episode_state, episode_action, success, episode_length, seed)
@@ -222,7 +222,9 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
                 env.close()
                 return None, None, False, 0, seed
 
-            episode_state[_step] = state_obs["rgb_image"]
+            if use_rgb_states: episode_state[_step] = state_obs["rgb_image"]
+            else: episode_state[_step] = state_obs["image"]
+
             episode_action[_step] = action
 
             state_obs, reward, terminated, truncated, info = env.step(action)
@@ -239,6 +241,7 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
         return None, None, False, 0, seed
 
 def collect_demonstrations(
+    use_rgb_states = True,
     env_id = "BabyAI-MiniBossLevel-v0",
     num_seeds = 100,
     num_episodes_per_seed = 100,
@@ -280,7 +283,9 @@ def collect_demonstrations(
     temp_env = FullyObsWrapper(temp_env.unwrapped)
     temp_env = SymbolicObsWrapper(temp_env.unwrapped)
     temp_env = RGBImgPartialObsWrapper(temp_env.unwrapped)
-    state_shape = temp_env.observation_space['rgb_image'].shape
+
+    if use_rgb_states: state_shape = temp_env.observation_space['rgb_image'].shape
+    else: state_shape = temp_env.observation_space['image'].shape
     temp_env.close()
 
     logger.info(f"Detected state shape: {state_shape} for env {env_id} and num_actions: {num_actions}")
@@ -340,7 +345,7 @@ def collect_demonstrations(
         for _ in range(min(max_pending, len(all_seeds))):
             seed = next(seed_iter, None)
             if exists(seed):
-                future = executor.submit(collect_single_episode, env_id, seed, num_steps, random_action_prob, state_shape, num_actions)
+                future = executor.submit(collect_single_episode, env_id, seed, num_steps, random_action_prob, state_shape, num_actions, use_rgb_states)
                 futures[future] = seed
 
         # collect
