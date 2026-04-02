@@ -2,7 +2,6 @@
 # /// script
 # dependencies = [
 #   "gymnasium",
-#   "minigrid",
 #   "tqdm",
 #   "fire",
 #   "memmap-replay-buffer>=0.0.29",
@@ -43,8 +42,16 @@ from memmap_replay_buffer import ReplayBuffer
 # Difficulty thresholds based on mission length
 EASY_MAX_LENGTH = 30      # easy: 0 to 30
 MEDIUM_MAX_LENGTH = 75    # medium: 30 to 75, hard: > 75
+MIN_ACCEPTABLE_LENGTH = 20
 
 # helpers
+
+def make_env(env_id, **kwargs):
+    if env_id == "NGoals":
+        from environments.ngoals import NGoalsEnv
+        return NGoalsEnv(**kwargs)
+    else:
+        return gym.make(env_id, **kwargs)
 
 def exists(val):
     return val is not None
@@ -57,7 +64,7 @@ def get_mission_for_seed(env_id, seed):
     Get the mission string for a given seed.
     Returns (mission_length, mission_string).
     """
-    env = gym.make(env_id, render_mode="rgb_array")
+    env = make_env(env_id, render_mode="rgb_array")
     env.reset(seed=seed)
     mission = env.unwrapped.mission
     env.close()
@@ -161,7 +168,7 @@ class BabyAIBotEpsilonGreedy:
 
 # functions
 
-def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_shape, num_actions=None, use_rgb_states = False):
+def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_shape, num_actions=None, use_rgb_states = False, use_difficulty = False):
     """
     Collect a single episode of demonstrations.
     Returns tuple of (episode_state, episode_action, success, episode_length, seed)
@@ -170,50 +177,55 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
     if env_id not in gym.envs.registry:
         minigrid.register_minigrid_envs()
 
-    env = gym.make(env_id, render_mode="rgb_array", highlight=False)
+    env = make_env(env_id, render_mode="rgb_array", highlight=False)
     if use_rgb_states:
         env = RGBImgPartialObsWrapper(env)
     else:
         env = SymbolicObsWrapper(env)
 
-    try:
-        state_obs, _ = env.reset(seed=seed)
-        episode_state = np.zeros((num_steps, *state_shape), dtype=np.uint8)
-        episode_action = np.zeros(num_steps, dtype=np.uint8)
+    state_obs, _ = env.reset(seed=seed)
+    episode_state = np.zeros((num_steps, *state_shape), dtype=np.uint8)
+    episode_action = np.zeros(num_steps, dtype=np.uint8)
 
-        expert = BabyAIBotEpsilonGreedy(env.unwrapped, random_action_prob=random_action_prob, num_actions=num_actions)
+    expert = BabyAIBotEpsilonGreedy(env.unwrapped, random_action_prob=random_action_prob, num_actions=num_actions)
 
-        for _step in range(num_steps):
-            try:
-                action = expert(state_obs)
-            except Exception:
-                env.close()
-                return None, None, False, 0, seed
+    for _step in range(num_steps):
+        try:
+            action = expert(state_obs)
+        except Exception:
+            env.close()
+            return None, None, False, 0, seed
 
-            obs_image = state_obs["image"].copy()
+        obs_image = state_obs["image"].copy()
 
-            if not use_rgb_states:
-                # SymbolicObsWrapper uses -1 for None grid cells (empty floor),
-                # which overflows to 255 in uint8. Map to "empty" (1).
-                obj_type_channel = obs_image[..., 2]
-                obj_type_channel[obj_type_channel > max(OBJECT_TO_IDX.values())] = OBJECT_TO_IDX["empty"]
+        if not use_rgb_states:
+            # SymbolicObsWrapper uses -1 for None grid cells (empty floor),
+            # which overflows to 255 in uint8. Map to "empty" (1).
+            obj_type_channel = obs_image[..., 2]
+            obj_type_channel[obj_type_channel > max(OBJECT_TO_IDX.values())] = OBJECT_TO_IDX["empty"]
 
-            episode_state[_step] = obs_image
+        episode_state[_step] = obs_image
 
-            episode_action[_step] = action
+        episode_action[_step] = action
 
-            state_obs, reward, terminated, truncated, info = env.step(action)
+        state_obs, reward, terminated, truncated, info = env.step(action)
 
-            if terminated:
-                env.close()
-                return episode_state, episode_action, True, _step + 1, seed
+        if terminated:
+            print(reward)
+            env.close()
+            # Filter trivial trajectories (when we select by difficulty)
+            if use_difficulty and _step < MIN_ACCEPTABLE_LENGTH: 
+                return None, None, False, 0, seed 
+            # Accept trajectory
+            return episode_state, episode_action, True, _step + 1, seed
 
-        env.close()
-        return episode_state, episode_action, False, num_steps, seed
+    env.close()
+    return episode_state, episode_action, False, num_steps, seed
 
-    except Exception:
-        env.close()
-        return None, None, False, 0, seed
+    # try:
+    # except Exception:
+    #     env.close()
+    #     return None, None, False, 0, seed
 
 def collect_demonstrations(
     use_rgb_states = False,
@@ -223,8 +235,9 @@ def collect_demonstrations(
     num_steps = 500,
     random_action_prob = 0.05,
     num_workers = None,
-    difficulty = "easy",
+    difficulty = None,
     output_dir = "babyai-minibosslevel-trajectories",
+    use_mission_embeddings = False,
     mission_embed_dim = 384,
     num_actions = None,         # if the actual number of actions is different from the environment's action space, provide it here (for BabyAI-MiniBossLevel-v0, it's 4: https://minigrid.farama.org/environments/babyai/MiniBossLevel/)
 ):
@@ -239,12 +252,15 @@ def collect_demonstrations(
     """
 
     # Normalize difficulty to list and validate
-    if isinstance(difficulty, str):
-        difficulty = [difficulty]
-    assert all(d in ['easy', 'medium', 'hard'] for d in difficulty), f"difficulty must be in ['easy','medium','hard'], got {difficulty}"
-
+    if difficulty != None:
+        if isinstance(difficulty, str):
+            difficulty = [difficulty]
+        assert all(d in ['easy', 'medium', 'hard'] for d in difficulty), f"difficulty must be in ['easy','medium','hard'], got {difficulty}"
+        n_levels = len(difficulty)
+    else:
+        n_levels = 1
+        
     # Divide num_seeds among difficulty levels (remainder goes to first levels)
-    n_levels = len(difficulty)
     base = num_seeds // n_levels
     remainder = num_seeds % n_levels
     num_seeds_per_level = [base + (1 if i < remainder else 0) for i in range(n_levels)]
@@ -254,7 +270,7 @@ def collect_demonstrations(
         minigrid.register_minigrid_envs()
 
     # Determine state shape from environment
-    temp_env = gym.make(env_id)
+    temp_env = make_env(env_id)
     if use_rgb_states:
         temp_env = RGBImgPartialObsWrapper(temp_env)
     else:
@@ -270,19 +286,22 @@ def collect_demonstrations(
     total_episodes = num_seeds * num_episodes_per_seed
 
     # Filter seeds: collect per level with quotas, then merge
-    seeds, seed_to_mission = categorize_seeds_by_difficulty(
-        env_id, num_seeds_per_level=num_seeds_per_level, level_difficulty=difficulty
-    )
-    # Merge seeds from all difficulty levels (order: first level, then second, ...)
-    selected_seeds = [s for level in difficulty for s in seeds[level]]
+    if difficulty != None:
+        seeds, seed_to_mission = categorize_seeds_by_difficulty(
+            env_id, num_seeds_per_level=num_seeds_per_level, level_difficulty=difficulty
+        )
+        # Merge seeds from all difficulty levels (order: first level, then second, ...)
+        selected_seeds = [s for level in difficulty for s in seeds[level]]
+    else:
+        selected_seeds = list(range(num_seeds))
 
     # pre-compute embeddings on master process (harder to handle with subprocesses)
-
-    logger.info("Pre-computing mission embeddings with GPU...")
-    sbert = get_sbert(local_files_only = False, device = "cuda" if torch.cuda.is_available() else "cpu")
-    missions = [seed_to_mission[s] for s in selected_seeds]
-    embeddings = get_missions_embeddings(missions, sbert).cpu().numpy()
-    seed_to_embedding = {s: embeddings[i] for i, s in enumerate(selected_seeds)}
+    if use_mission_embeddings:
+        logger.info("Pre-computing mission embeddings with GPU...")
+        sbert = get_sbert(local_files_only = False, device = "cuda" if torch.cuda.is_available() else "cpu")
+        missions = [seed_to_mission[s] for s in selected_seeds]
+        embeddings = get_missions_embeddings(missions, sbert).cpu().numpy()
+        seed_to_embedding = {s: embeddings[i] for i, s in enumerate(selected_seeds)}
 
     successful = 0
     progressbar = tqdm(total=total_episodes)
@@ -319,7 +338,8 @@ def collect_demonstrations(
         for _ in range(min(max_pending, len(all_seeds))):
             seed = next(seed_iter, None)
             if exists(seed):
-                future = executor.submit(collect_single_episode, env_id, seed, num_steps, random_action_prob, state_shape, num_actions, use_rgb_states)
+                use_difficulty = (difficulty != None)
+                future = executor.submit(collect_single_episode, env_id, seed, num_steps, random_action_prob, state_shape, num_actions, use_rgb_states, use_difficulty)
                 futures[future] = seed
 
         # collect
@@ -332,11 +352,19 @@ def collect_demonstrations(
                 episode_state, episode_action, success, episode_length, returned_seed = future.result()
 
                 if success and exists(episode_state):
-                    buffer.store_episode(
-                        state = episode_state[:episode_length],
-                        action = episode_action[:episode_length],
-                        mission_embedding = seed_to_embedding[returned_seed],
-                    )
+                    if use_mission_embeddings: 
+                        mission_embedding = seed_to_embedding[returned_seed]
+                        buffer.store_episode(
+                            state = episode_state[:episode_length],
+                            action = episode_action[:episode_length],
+                            mission_embedding = mission_embedding,
+                        )
+                    else:
+                        buffer.store_episode(
+                            state = episode_state[:episode_length],
+                            action = episode_action[:episode_length]
+                        )
+                    
                     successful += 1
 
                 progressbar.update(1)
