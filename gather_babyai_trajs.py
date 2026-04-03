@@ -17,6 +17,7 @@ import random
 import multiprocessing
 from loguru import logger
 from pathlib import Path
+from torchvision import transforms
 
 import warnings
 warnings.filterwarnings("ignore", category = UserWarning)
@@ -45,6 +46,12 @@ MEDIUM_MAX_LENGTH = 75    # medium: 30 to 75, hard: > 75
 MIN_ACCEPTABLE_LENGTH = 20
 
 # helpers
+
+def downsample_img(image, out_size=64):
+    downsample = transforms.Resize((out_size, out_size, 3))
+    if not isinstance(image, torch.Tensor):
+        image = torch.tensor(image)
+    return downsample(image).numpy()
 
 def make_env(env_id, **kwargs):
     if env_id == "NGoals":
@@ -186,41 +193,59 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
     state_obs, _ = env.reset(seed=seed)
     episode_state = np.zeros((num_steps, *state_shape), dtype=np.uint8)
     episode_action = np.zeros(num_steps, dtype=np.uint8)
+    episode_betas = np.zeros(num_steps, dtype=np.uint8)
 
     expert = BabyAIBotEpsilonGreedy(env.unwrapped, random_action_prob=random_action_prob, num_actions=num_actions)
+    cumulative_reward = 0
+    next_goal = None
 
     for _step in range(num_steps):
         try:
             action = expert(state_obs)
         except Exception:
             env.close()
-            return None, None, False, 0, seed
+            return None, None, None, False, 0, seed
 
         obs_image = state_obs["image"].copy()
 
-        if not use_rgb_states:
-            # SymbolicObsWrapper uses -1 for None grid cells (empty floor),
-            # which overflows to 255 in uint8. Map to "empty" (1).
-            obj_type_channel = obs_image[..., 2]
-            obj_type_channel[obj_type_channel > max(OBJECT_TO_IDX.values())] = OBJECT_TO_IDX["empty"]
+        # if not use_rgb_states:
+        #     # SymbolicObsWrapper uses -1 for None grid cells (empty floor),
+        #     # which overflows to 255 in uint8. Map to "empty" (1).
+        #     obj_type_channel = obs_image[..., 2]
+        #     obj_type_channel[obj_type_channel > max(OBJECT_TO_IDX.values())] = OBJECT_TO_IDX["empty"]
 
         episode_state[_step] = obs_image
 
         episode_action[_step] = action
 
         state_obs, reward, terminated, truncated, info = env.step(action)
+        cumulative_reward += reward
 
+        # Switch beta signal: only on next goal change
+        if next_goal == None:
+            episode_betas[_step] = 0.0
+            next_goal = env.unwrapped.next_goal
+        else:
+            if env.unwrapped.next_goal == next_goal:
+                episode_betas[_step] = 0.0
+            else:
+                episode_betas[_step] = 1.0
+                next_goal = env.unwrapped.next_goal
+        
+        # Store on termination
         if terminated:
-            print(reward)
             env.close()
             # Filter trivial trajectories (when we select by difficulty)
             if use_difficulty and _step < MIN_ACCEPTABLE_LENGTH: 
-                return None, None, False, 0, seed 
+                return None, None, None, False, 0, seed 
+            # Check task failure
+            if cumulative_reward <= 0.0:
+                return None, None, None, False, 0, seed 
             # Accept trajectory
-            return episode_state, episode_action, True, _step + 1, seed
+            return episode_state, episode_action, episode_betas, True, _step + 1, seed
 
     env.close()
-    return episode_state, episode_action, False, num_steps, seed
+    return episode_state, episode_action, episode_betas, False, num_steps, seed
 
     # try:
     # except Exception:
@@ -272,8 +297,10 @@ def collect_demonstrations(
     # Determine state shape from environment
     temp_env = make_env(env_id)
     if use_rgb_states:
+        print("[+] Using RGB partial obs wrapper wrapper")
         temp_env = RGBImgPartialObsWrapper(temp_env)
     else:
+        print("[+] Using symbolic obs wrapper")
         temp_env = SymbolicObsWrapper(temp_env)
     state_shape = temp_env.observation_space['image'].shape
     temp_env.close()
@@ -311,6 +338,7 @@ def collect_demonstrations(
     fields = {
         'state': ('float', state_shape),
         'action': ('float', ()),
+        'episode_betas': ('uint8', ()),
     }
 
     meta_fields = {
@@ -349,7 +377,7 @@ def collect_demonstrations(
 
             for future in done:
                 seed = futures.pop(future)
-                episode_state, episode_action, success, episode_length, returned_seed = future.result()
+                episode_state, episode_action, episode_betas, success, episode_length, returned_seed = future.result()
 
                 if success and exists(episode_state):
                     if use_mission_embeddings: 
@@ -357,12 +385,14 @@ def collect_demonstrations(
                         buffer.store_episode(
                             state = episode_state[:episode_length],
                             action = episode_action[:episode_length],
+                            episode_betas = episode_betas[:episode_length],
                             mission_embedding = mission_embedding,
                         )
                     else:
                         buffer.store_episode(
                             state = episode_state[:episode_length],
-                            action = episode_action[:episode_length]
+                            action = episode_action[:episode_length],
+                            episode_betas = episode_betas[:episode_length],
                         )
                     
                     successful += 1
