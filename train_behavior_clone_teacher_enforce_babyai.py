@@ -39,6 +39,7 @@ from torch_einops_utils import maybe, lens_to_mask
 import matplotlib.pyplot as plt
 import wandb
 
+from metacontroller import EnforcedMetaController
 from metacontroller import MetaController, Transformer, binary_entropy
 from metacontroller.transformer_with_resnet import TransformerWithResnet
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
@@ -61,9 +62,14 @@ def is_new_suite_env(env_id):
 
 # helpers
 
-def symlog(x):
-    """Applies symmetric log transformation."""
-    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+def binary_betas_to_goal_index(betas:torch.Tensor):
+    """
+        Convert from binary betas (B, T) to dense goal index (B, T)
+        example: a = [0 0 1 0 0 1 0 0 1 0 0]
+                 b = [0 0 1 1 1 2 2 2 3 3 3]
+        Every timestep carries the current subgoal label (cumsum of betas).
+    """
+    return torch.cumsum(betas, dim=1).long()
 
 def set_requires_grad(network: nn.Module, grad_val: bool):
     for param in network.parameters():
@@ -200,7 +206,7 @@ def train(
     hypernetwork_low_rank = 8,
     target_temporal_segment_len = 4,
     compact_sequence_embedding = False,
-    feasibility_restoration = False
+    num_goals = 3
 ):
 
     torch.manual_seed(run_seed)
@@ -216,15 +222,31 @@ def train(
                 checkpoint_path_with_step = checkpoint_path
                 meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path
 
-            if not is_discovering or not exists(step):
-                unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_model.save(checkpoint_path_with_step)
-                accelerator.print(f"Model saved to {checkpoint_path_with_step}")
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save(checkpoint_path_with_step)
+            accelerator.print(f"Model saved to {checkpoint_path_with_step}")
 
-            if is_discovering or not exists(step):
-                unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
-                unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
-                accelerator.print(f"MetaController to {meta_controller_checkpoint_path_with_step}")
+            unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
+            unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
+            accelerator.print(f"MetaController saved to {meta_controller_checkpoint_path_with_step}")
+
+            # if exists(step):
+            #     # Add step to checkpoint filenames
+            #     checkpoint_path_with_step = checkpoint_path.replace('.pt', f'_step_{step}.pt')
+            #     meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path.replace('.pt', f'_step_{step}.pt')
+            # else:
+            #     checkpoint_path_with_step = checkpoint_path
+            #     meta_controller_checkpoint_path_with_step = meta_controller_checkpoint_path
+
+            # if not is_discovering or not exists(step):
+            #     unwrapped_model = accelerator.unwrap_model(model)
+            #     unwrapped_model.save(checkpoint_path_with_step)
+            #     accelerator.print(f"Model saved to {checkpoint_path_with_step}")
+
+            # if is_discovering or not exists(step):
+            #     unwrapped_meta_controller = accelerator.unwrap_model(meta_controller)
+            #     unwrapped_meta_controller.save(meta_controller_checkpoint_path_with_step)
+            #     accelerator.print(f"MetaController saved to {meta_controller_checkpoint_path_with_step}")
 
             
     # check for yaml file
@@ -303,33 +325,11 @@ def train(
 
     accelerator.print(f"Detected state_dim: {state_dim}, num_actions: {num_actions} from env: {env_id}")
 
-    # meta controller
-    if not use_binary_mapper:
-        meta_controller = MetaController(
-            dim,
-            switch_temperature = switch_temperature,
-            ratio_loss_weight = discovery_ratio_loss_weight,
-            kl_loss_weight = discovery_kl_loss_weight,
-            kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
-            apply_kl_loss_weight = True,
-            compact_sequence_embedding = compact_sequence_embedding,
-            pool_embedded_sequence = False,
-            bidirectional = True
-        )
-    else:
-        meta_controller = MetaControllerWithBinaryMapper(
-            dim_model = dim,
-            dim_meta_controller = dim_meta_controller,
-            dim_code_bits = dim_code_bits,
-            kl_loss_threshold = kl_loss_threshold,
-            switch_temperature = switch_temperature,
-            hypernetwork_low_rank = hypernetwork_low_rank,
-            target_temporal_segment_len = target_temporal_segment_len,
-            ratio_loss_weight = discovery_ratio_loss_weight,
-            kl_loss_weight = discovery_kl_loss_weight,
-            kl_loss_warmup_steps = discovery_kl_loss_warmup_steps,
-            apply_kl_loss_weight = True,
-        )
+    # meta controller (teacher-enforced)
+    meta_controller = EnforcedMetaController(
+        num_goals = num_goals,
+        embed_dim = dim
+    )
 
     # transformer
     
@@ -529,6 +529,8 @@ def train(
         optim = optim_model if not is_discovering else optim_meta_controller
 
         for batch in progress_bar:
+
+            goal_signals = batch['episode_goal_ids'] # B, T
             
             # rgb -> norm and multichannel, ready for resnet
             if modality == MODALITY_RESNET_RGB:
@@ -575,7 +577,8 @@ def train(
                         force_behavior_cloning = not is_discovering,
                         return_meta_controller_output = True,
                         condition = mission_embeddings,
-                        return_visual_autoencoder_loss = True
+                        return_visual_autoencoder_loss = True,
+                        goal_signals = goal_signals
                     )
                 else:
                     losses, meta_controller_output = model(
@@ -585,7 +588,8 @@ def train(
                         discovery_phase = is_discovering,
                         force_behavior_cloning = not is_discovering,
                         return_meta_controller_output = True,
-                        condition = mission_embeddings
+                        condition = mission_embeddings,
+                        goal_signals = goal_signals
                     )
 
                 # loss: resnet pretraining
@@ -632,16 +636,18 @@ def train(
                         last_soft_switch_density = meta_controller_output.switch_beta.mean().item()
 
                     # zero betas -> feasibility restoration -> losses: (entropy, kl)
-            
-                    if feasibility_restoration and last_hard_switch_density < 0.1:
-                            entropy_weight = -discovery_negative_entropy_loss_weight
-                            discovery_obs_loss_weight = 0
-                            discovery_action_recon_loss_weight = 0
-                    else:
-                        entropy_weight = discovery_entropy_loss_weight
-                        discovery_obs_loss_weight = old_discovery_obs_loss_weight
-                        discovery_action_recon_loss_weight = old_discovery_action_recon_loss_weight
-        
+                    # if last_hard_switch_density < 0.1:
+                    #     entropy_weight = -discovery_negative_entropy_loss_weight
+                    #     discovery_obs_loss_weight = 0
+                    #     discovery_action_recon_loss_weight = 0
+                    # else:
+                    #     entropy_weight = discovery_entropy_loss_weight
+                    #     discovery_obs_loss_weight = old_discovery_obs_loss_weight
+                    #     discovery_action_recon_loss_weight = old_discovery_action_recon_loss_weight
+                    entropy_weight = discovery_entropy_loss_weight
+                    discovery_obs_loss_weight = old_discovery_obs_loss_weight
+                    discovery_action_recon_loss_weight = old_discovery_action_recon_loss_weight
+
                     # kl and ratio loss are weighted inside the metacontroller
                     
                     loss = (

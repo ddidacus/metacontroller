@@ -923,26 +923,29 @@ class Transformer(Module):
             self.discovery_action_loss_normalizer = LossNormalizer(num_losses = 1, beta = loss_normalizer_beta)
 
         if exists(dim_condition):
-            transformer_kwargs = dict(
+            # Upper body only gets condition: mission conditions the policy readout, not the residual
+            # stream. So the meta_controller sees an unconditional residual and switch betas don't collapse.
+            upper_transformer_kwargs = dict(
                 dim_condition = dim_condition,
                 use_adaptive_rmsnorm = True,
                 polar_pos_emb = True
             )
+            lower_transformer_kwargs = dict(use_rmsnorm = True, polar_pos_emb = True)
         else:
-            transformer_kwargs = dict(
+            upper_transformer_kwargs = lower_transformer_kwargs = dict(
                 use_rmsnorm = True,
                 polar_pos_emb = True
             )
 
         if isinstance(lower_body, dict):
-            lower_body = Decoder(dim = dim, pre_norm_has_final_norm = False, **transformer_kwargs, **lower_body)
+            lower_body = Decoder(dim = dim, pre_norm_has_final_norm = False, **lower_transformer_kwargs, **lower_body)
 
             # x_transformers passes condition into final_norm when need_condition; nn.Identity() rejects kwargs → use wrapper
             # remove at later date, should be fixed in latest x-transformers
             lower_body.final_norm = Identity()
 
         if isinstance(upper_body, dict):
-            upper_body = Decoder(dim = dim, **transformer_kwargs, **upper_body)
+            upper_body = Decoder(dim = dim, **upper_transformer_kwargs, **upper_body)
 
         self.state_embed, self.state_readout = EmbedAndReadout(dim, **state_embed_readout)
         action_embed, self.action_readout = EmbedAndReadout(dim, **action_embed_readout)
@@ -1107,7 +1110,8 @@ class Transformer(Module):
         ablate_switch_beta: Tensor | None = None,
         switch_beta_frequency: int | None = None,
         update_loss_ema: bool | None = None,
-        hard_switch: bool | None = None
+        hard_switch: bool | None = None,
+        goal_signals: Tensor | None = None
     ):
 
         device = state.device
@@ -1197,9 +1201,11 @@ class Transformer(Module):
             if return_embed:
                 return embed
 
+            # Lower body is unconditional so meta_controller sees same residual distribution
+            # regardless of mission; condition is applied only in upper_body (policy readout).
             residual_stream, next_lower_hiddens = self.lower_body(
                 embed,
-                condition = condition,
+                condition = None,
                 cache = lower_transformer_hiddens,
                 return_hiddens = True
             )
@@ -1209,18 +1215,25 @@ class Transformer(Module):
         with meta_controller_context():
 
             if exists(meta_controller) and not behavioral_cloning:
-                meta_cache = None if discovery_phase else meta_hiddens
-                control_signal, next_meta_hiddens = meta_controller(
-                    residual_stream,
-                    cache = meta_cache,
-                    discovery_phase = discovery_phase,
-                    temperature = meta_controller_temperature,
-                    episode_lens = episode_lens,
-                    ablate_switch_beta = ablate_switch_beta,
-                    switch_beta_frequency = switch_beta_frequency,
-                    ablate_offset = cache_steps,
-                    hard_switch = hard_switch
-                )
+                from metacontroller.metacontroller_teacher_enforce import EnforcedMetaController
+                if isinstance(meta_controller, EnforcedMetaController):
+                    control_signal, next_meta_hiddens = meta_controller(
+                        residual_stream,
+                        goal_signals = goal_signals
+                    )
+                else:
+                    meta_cache = None if discovery_phase else meta_hiddens
+                    control_signal, next_meta_hiddens = meta_controller(
+                        residual_stream,
+                        cache = meta_cache,
+                        discovery_phase = discovery_phase,
+                        temperature = meta_controller_temperature,
+                        episode_lens = episode_lens,
+                        ablate_switch_beta = ablate_switch_beta,
+                        switch_beta_frequency = switch_beta_frequency,
+                        ablate_offset = cache_steps,
+                        hard_switch = hard_switch
+                    )
             else:
                 control_signal, next_meta_hiddens = self.zero, None
 

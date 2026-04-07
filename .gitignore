@@ -10,6 +10,8 @@ notebooks/
 *.slurm
 *.lock
 *.pt
+ngoals*/
+results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -38,6 +40,11 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.csv
+bot-minigrid-babyai/
+plot_data
+*.ipynb
+*.tex
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

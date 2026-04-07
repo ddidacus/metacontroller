@@ -13,7 +13,7 @@
 # ///
 # To train with multiple GPUs:
 # 1. accelerate config
-# 2. accelerate launch train_babyai_onpolicy.py [args]
+# 2. accelerate launch train_babyai_onpolicy_teacher_enforce.py [args]
 
 from fire import Fire
 from pathlib import Path
@@ -56,16 +56,18 @@ def create_env(env_id, **kwargs):
         use_symbolic = kwargs.pop('use_symbolic', True)
         kwargs.pop('video_folder', None)
         kwargs.pop('render_every_eps', None)
-        env = NGoalsEnv(**kwargs)
+        env = NGoalsEnv(task_length=4, training_mode="eval", **kwargs)
         if use_symbolic:
             env = SymbolicObsWrapper(env)
         ngoals_charset = " " + string.ascii_lowercase + string.ascii_uppercase + string.digits + "',.-:"
         env = BabyAISharedMemoryWrapper(env, charset=ngoals_charset)
         return env
     return _babyai_create_env(env_id, **kwargs)
+
 import gymnasium as gym
 from gymnasium.vector import AsyncVectorEnv
 from metacontroller.metacontroller import Transformer, MetaController, z_score, extract_grpo_data
+from metacontroller.metacontroller_teacher_enforce import EnforcedMetaController
 from metacontroller.transformer_with_resnet import TransformerWithResnet
 from metacontroller.metacontroller_with_binary_mapper import MetaControllerWithBinaryMapper
 from torch.nn.parallel import DistributedDataParallel
@@ -251,54 +253,41 @@ def visualize_switch_betas(
     use_wandb = False,
     accelerator = None
 ):
-    """
-    Visualize switch betas for randomly sampled sequences in the batch.
-    Logs a single stacked figure to wandb.
-    """
     B, T_minus_1 = switch_betas.shape
-    
-    # randomly sample sequences from the batch
+
     num_samples = min(num_samples, B)
     sample_indices = np.random.choice(B, size=num_samples, replace=False)
-    
-    # create figure with num_samples subplots
+
     fig, axes = plt.subplots(num_samples, 1, figsize=(12, 3 * num_samples))
     fig.suptitle(f'Step {gradient_step} | Switch Betas Visualization', fontsize=10)
-    
-    # handle single subplot case
+
     if num_samples == 1:
         axes = [axes]
-    
+
     for i, idx in enumerate(sample_indices):
-        # get episode length for this sample (if available)
         if episode_lens is not None:
             ep_len = int(episode_lens[idx].item())
         else:
             ep_len = T_minus_1
-        
-        # extract data for this sample
-        sample_switch_betas = switch_betas[idx, :ep_len-1].detach().cpu()  # (T-1,)
-        
+
+        sample_switch_betas = switch_betas[idx, :ep_len-1].detach().cpu()
+
         ax = axes[i]
-        
-        # plot switch betas
         ax.plot(sample_switch_betas.numpy(), label='switch betas', linewidth=2)
         ax.set_xlabel('timesteps')
         ax.set_ylabel(f'switch betas (sample {idx})')
         ax.legend(loc='upper right')
-    
+
     plt.tight_layout()
-    
-    # log to wandb
+
     if use_wandb and exists(accelerator):
         tracker = accelerator.get_tracker("wandb")
         if exists(tracker):
             tracker.log({
                 f"switch_betas/step_{gradient_step}": wandb.Image(fig)
             }, step=gradient_step)
-    
-    plt.close(fig)
 
+    plt.close(fig)
 
 
 # main
@@ -307,7 +296,7 @@ def main(
     seed: int | list[int] | tuple | str | None = 456,
     npy_seedfile = None,
     npy_seedfile_seeds_limit = None,
-    env_name = 'BabyAI-BossLevel-v0',
+    env_name = 'NGoals',
     num_episodes = int(10e6),
     max_timesteps = 500,
     render_every_eps = 1_000,
@@ -316,23 +305,25 @@ def main(
     transformer_weights_path: str | None = None,
     meta_controller_weights_path: str | None = None,
     output_meta_controller_path = 'metacontroller_rl_trained.pt',
-    modality = MODALITY_RAW_RGB,
+    modality = MODALITY_SYMBOLIC,
     lr = 3e-5,
+    dim=512,
     save_steps = 100,
     eval_steps = 50,
     batch_size = 16,
     max_grad_norm = None,
     use_wandb = False,
-    wandb_project = 'metacontroller-babyai-rl',
+    wandb_project = 'metacontroller-babyai-rl-teacher-enforce',
     reject_threshold_cumulative_reward_variance = None,
     condition_on_mission_embed = False,
-    use_binary_mapper = False,
     env_shared_memory = True,
     env_context = 'fork',
     num_epochs = 4,
+    num_goals = 8,
+    run_seed = 456,
 ):
 
-    torch.manual_seed(456)
+    torch.manual_seed(run_seed)
 
     if not exists(max_grad_norm): max_grad_norm = float('inf')
 
@@ -344,7 +335,6 @@ def main(
             accelerator.print(f"MetaController to {meta_controller_checkpoint_path_with_step}")
 
     # seed selection priority: 1) numpy seedfile, 2) --seed (int or list), 3) random
-    # Only use npy_seedfile when it is path-like (Fire can wrongly pass an int from e.g. --seed 111 113 ...)
 
     group_seeds = None
     if exists(npy_seedfile) and (isinstance(npy_seedfile, (str, bytes, Path)) or hasattr(npy_seedfile, '__fspath__')):
@@ -365,7 +355,6 @@ def main(
             return group_seeds[torch.randint(0, len(group_seeds), (1,)).item()]
         return torch.randint(0, 1000000, (1,)).item()
 
-    # batch_size = number of simultaneous trajectories (the group) = number of parallel envs
     assert batch_size >= 2, "batch_size must be at least 2 for relative comparison (GRPO)"
 
     # accelerator
@@ -373,7 +362,14 @@ def main(
     accelerator = Accelerator(log_with = 'wandb' if use_wandb else None)
 
     if use_wandb:
-        accelerator.init_trackers(wandb_project)
+        accelerator.init_trackers(wandb_project, config=dict(
+            run_seed=run_seed,
+            env_name=env_name,
+            modality=modality,
+            lr=lr,
+            batch_size=batch_size,
+            num_goals=num_goals,
+        ))
 
     # environment
 
@@ -388,7 +384,6 @@ def main(
 
     env = AsyncVectorEnv([env_make_fn] * batch_size, shared_memory = env_shared_memory, context = env_context)
 
-
     # load models
 
     model = None
@@ -399,20 +394,35 @@ def main(
         model = transformer_klass.init_and_load(str(weights_path), strict = False)
         model.eval()
 
-    meta_controller = None
+    # teacher-enforced meta controller
+    assert exists(model), "need a loaded transformer to infer embed_dim for EnforcedMetaController"
+    meta_controller = EnforcedMetaController(
+        num_goals=num_goals - 1, 
+        embed_dim=dim
+    )
+
     if exists(meta_controller_weights_path):
         weights_path = Path(meta_controller_weights_path)
         assert weights_path.exists(), f"meta controller weights not found at {weights_path}"
-        meta_controller_klass = MetaControllerWithBinaryMapper if use_binary_mapper else MetaController
-        meta_controller = meta_controller_klass.init_and_load(str(weights_path), strict = False)
-        meta_controller.eval()
+        try:
+            state_dict = torch.load(str(weights_path), map_location='cpu', weights_only=False)['model']
+            meta_controller.load_state_dict(state_dict, strict=False)
+            accelerator.print(f"Loaded meta controller weights from {weights_path}")
+        except Exception as e:
+            accelerator.print(f"WARNING: could not load meta controller weights ({e}), starting fresh")
+    else:
+        accelerator.print("No meta controller weights path provided, starting fresh")
 
-    meta_controller = default(meta_controller, getattr(model, 'meta_controller', None))
-    assert exists(meta_controller), "MetaController must be present for reinforcement learning"
+    # attach meta_controller to the model so the forward pass uses it
+    if exists(model):
+        model.meta_controller = meta_controller
 
-    # optimizer
+    meta_controller_from_model = default(meta_controller, getattr(model, 'meta_controller', None))
+    assert exists(meta_controller_from_model), "EnforcedMetaController must be present for RL"
 
-    optim = Adam(meta_controller.internal_rl_parameters(), lr = lr)
+    # optimizer — only train the meta controller probes
+
+    optim = Adam(meta_controller.discovery_parameters(), lr = lr)
 
     # prepare
 
@@ -426,8 +436,8 @@ def main(
     num_batch_updates = num_episodes // batch_size
 
     pbar = tqdm(range(num_batch_updates), desc = 'training')
-    
-    print("starting training")
+
+    accelerator.print("starting training")
     unwrapped_model.eval()
     unwrapped_meta_controller.train()
 
@@ -436,9 +446,12 @@ def main(
 
     group_rejections = 0
 
+    # success rate tracking: from episode 0, fraction of terminated episodes with reward >= 0
+    total_episodes_completed = 0
+    total_episodes_success = 0
+
     for gradient_step in pbar:
 
-        # one group of batch_size trajectories per gradient step (for GRPO relative comparison)
         env_seeds = [get_next_seed() for _ in range(batch_size)]
 
         state, _ = env.reset(seed = env_seeds)
@@ -458,34 +471,26 @@ def main(
         iteration_rewards = []
 
         dones = torch.zeros(batch_size, dtype = torch.bool)
+        terminated_flags = torch.zeros(batch_size, dtype = torch.bool)
+        final_rewards = torch.zeros(batch_size)
 
         all_steps_dones = []
 
-        # rollout: batch of batch_size parallel trajectories (one env per trajectory)
+        # rollout
         for step in range(max_timesteps):
-            # state['image']: (batch_size, H, W, C)
             image = state['image']
             image_tensor = torch.from_numpy(image).float().to(accelerator.device)
 
-            # rgb -> norm and multichannel, ready for resnet
             if modality == MODALITY_RESNET_RGB:
                 image_tensor = torch.clamp(image_tensor / 255.0, min=0.0, max=1.0)
                 image_tensor = (image_tensor - torch.tensor([0.485, 0.456, 0.406]).to(image_tensor.device)) / torch.tensor([0.229, 0.224, 0.225]).to(image_tensor.device)
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 h w c')
-
-            # raw rgb -> norm and flatten
-
             elif modality == MODALITY_RAW_RGB:
                 image_tensor = torch.clamp(image_tensor / 255.0, min=0.0, max=1.0)
                 image_tensor = (image_tensor - torch.tensor([0.485, 0.456, 0.406]).to(image_tensor.device)) / torch.tensor([0.229, 0.224, 0.225]).to(image_tensor.device)
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 (h w c)')
-            
-            # symbolic -> just flatten
-
             elif modality == MODALITY_SYMBOLIC:
                 image_tensor = rearrange(image_tensor, 'b h w c -> b 1 (h w c)')
-
-            # actions
 
             if torch.is_tensor(past_action_id):
                 past_action_id = past_action_id.long()
@@ -516,6 +521,13 @@ def main(
             reward_tensor = torch.from_numpy(reward).float().to(accelerator.device)
             iteration_rewards.append(rearrange(reward_tensor, 'b -> b 1'))
 
+            # track which envs just finished and their terminal reward
+            just_done = torch.from_numpy(terminated | truncated) & ~dones
+            for i in range(batch_size):
+                if just_done[i]:
+                    terminated_flags[i] = bool(terminated[i])
+                    final_rewards[i] = float(reward[i])
+
             all_steps_dones.append(dones.clone())
             dones |= torch.from_numpy(terminated | truncated)
 
@@ -523,6 +535,13 @@ def main(
                 break
 
             state = next_state
+
+        # update success rate counters (on main process only)
+        if accelerator.is_main_process:
+            for i in range(batch_size):
+                total_episodes_completed += 1
+                if terminated_flags[i] and final_rewards[i] >= 0.0:
+                    total_episodes_success += 1
 
         episode_lens = (~torch.stack(all_steps_dones)).sum(dim = 0).to(accelerator.device)
 
@@ -532,21 +551,16 @@ def main(
         cur_latent_actions = cat(iteration_latent_actions, dim = 1)
         cur_rewards = cat(iteration_rewards, dim = 1)
 
-        # pack group data (single rollout → one group of batch_size trajectories)
-
         group_states = cur_states
         group_log_probs = cur_log_probs
         group_switch_betas = cur_switch_betas
         group_latent_actions = cur_latent_actions
-        
         group_step_rewards = cur_rewards
 
         # mask rewards after done
 
         mask = lens_to_mask(episode_lens, group_step_rewards.shape[-1])
         group_step_rewards = group_step_rewards * mask
-
-        # compute advantages via z-score (GRPO style)
 
         cumulative_rewards = group_step_rewards.sum(dim = -1)
 
@@ -564,19 +578,11 @@ def main(
             group_rejections += 1
             continue
 
-        # gather across GPUs if multi-GPU
-
         all_shaped_rewards = accelerator.gather(shaped_rewards)
-
-        # compute advantages via z-score (GRPO style)
-
         all_advantages = z_score(all_shaped_rewards).float()
-
-        # slice back to local process
 
         process_index = accelerator.process_index
         num_local_trajectories = shaped_rewards.shape[0]
-
         group_advantages = all_advantages[process_index * num_local_trajectories: (process_index + 1) * num_local_trajectories]
 
         if torch.any(torch.isnan(group_advantages)):
@@ -584,14 +590,12 @@ def main(
             group_rejections += 1
             continue
 
-        # whether to reject group based on switch betas (as it determines the mask for learning)
-
         if should_reject_group_based_on_switch_betas(group_switch_betas, episode_lens):
             accelerator.print(f'group rejected - switch betas for the entire group does not meet criteria for learning')
             group_rejections += 1
             continue
 
-        # learn on this group directly (on-policy GRPO, multi-epoch PPO)
+        # learn
 
         epoch_losses = []
         epoch_policy_losses = []
@@ -631,11 +635,13 @@ def main(
         mean_kl_loss = np.mean(epoch_kl_losses)
         mean_grad_norm = np.mean(epoch_grad_norms)
 
+        success_rate = total_episodes_success / total_episodes_completed if total_episodes_completed > 0 else 0.0
+
         pbar.set_postfix(
             loss = f'{mean_loss:.4f}',
             grad_norm = f'{mean_grad_norm:.4f}',
             reward = f'{cumulative_rewards.mean().item():.4f}',
-            seeds = f'{group_seeds}'
+            success_rate = f'{success_rate:.4f}',
         )
 
         accelerator.log({
@@ -648,9 +654,11 @@ def main(
             'switch_density': group_switch_betas.mean().item(),
             'group_rejections': group_rejections,
             'env_seed': group_seeds,
+            'success_rate': success_rate,
+            'total_episodes_completed': total_episodes_completed,
         }, step=gradient_step)
 
-        accelerator.print(f'loss: {mean_loss:.4f}, grad_norm: {mean_grad_norm:.4f}, reward: {cumulative_rewards.mean().item():.4f}, seeds: {group_seeds}')
+        accelerator.print(f'loss: {mean_loss:.4f}, grad_norm: {mean_grad_norm:.4f}, reward: {cumulative_rewards.mean().item():.4f}, success_rate: {success_rate:.4f}')
 
         if gradient_step % save_steps == 0:
             store_checkpoint(gradient_step)
@@ -679,8 +687,6 @@ def main(
             )
 
     env.close()
-
-    # save
 
     if exists(output_meta_controller_path):
         unwrapped_meta_controller.save(output_meta_controller_path)

@@ -56,7 +56,7 @@ def downsample_img(image, out_size=64):
 def make_env(env_id, **kwargs):
     if env_id == "NGoals":
         from environments.ngoals import NGoalsEnv
-        return NGoalsEnv(**kwargs)
+        return NGoalsEnv(training_mode="train", **kwargs)
     else:
         return gym.make(env_id, **kwargs)
 
@@ -193,11 +193,10 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
     state_obs, _ = env.reset(seed=seed)
     episode_state = np.zeros((num_steps, *state_shape), dtype=np.uint8)
     episode_action = np.zeros(num_steps, dtype=np.uint8)
-    episode_betas = np.zeros(num_steps, dtype=np.uint8)
+    episode_goal_ids = np.zeros(num_steps, dtype=np.uint8)
 
     expert = BabyAIBotEpsilonGreedy(env.unwrapped, random_action_prob=random_action_prob, num_actions=num_actions)
     cumulative_reward = 0
-    next_goal = None
 
     for _step in range(num_steps):
         try:
@@ -218,20 +217,12 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
 
         episode_action[_step] = action
 
+        # Collect id of current goal to pursue
+        episode_goal_ids[_step] = env.unwrapped.get_next_goal_id()
+
         state_obs, reward, terminated, truncated, info = env.step(action)
         cumulative_reward += reward
 
-        # Switch beta signal: only on next goal change
-        if next_goal == None:
-            episode_betas[_step] = 0.0
-            next_goal = env.unwrapped.next_goal
-        else:
-            if env.unwrapped.next_goal == next_goal:
-                episode_betas[_step] = 0.0
-            else:
-                episode_betas[_step] = 1.0
-                next_goal = env.unwrapped.next_goal
-        
         # Store on termination
         if terminated:
             env.close()
@@ -239,13 +230,13 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
             if use_difficulty and _step < MIN_ACCEPTABLE_LENGTH: 
                 return None, None, None, False, 0, seed 
             # Check task failure
-            if cumulative_reward <= 0.0:
+            if cumulative_reward <= 0.0 or _step < MIN_ACCEPTABLE_LENGTH:
                 return None, None, None, False, 0, seed 
             # Accept trajectory
-            return episode_state, episode_action, episode_betas, True, _step + 1, seed
+            return episode_state, episode_action, episode_goal_ids, True, _step + 1, seed
 
     env.close()
-    return episode_state, episode_action, episode_betas, False, num_steps, seed
+    return episode_state, episode_action, episode_goal_ids, False, num_steps, seed
 
     # try:
     # except Exception:
@@ -320,7 +311,7 @@ def collect_demonstrations(
         # Merge seeds from all difficulty levels (order: first level, then second, ...)
         selected_seeds = [s for level in difficulty for s in seeds[level]]
     else:
-        selected_seeds = list(range(num_seeds))
+        selected_seeds = list(range(num_seeds * num_episodes_per_seed))
 
     # pre-compute embeddings on master process (harder to handle with subprocesses)
     if use_mission_embeddings:
@@ -338,7 +329,7 @@ def collect_demonstrations(
     fields = {
         'state': ('float', state_shape),
         'action': ('float', ()),
-        'episode_betas': ('uint8', ()),
+        'episode_goal_ids': ('uint8', ()),
     }
 
     meta_fields = {
@@ -355,7 +346,7 @@ def collect_demonstrations(
     )
 
     max_pending = num_workers
-    all_seeds = selected_seeds * num_episodes_per_seed
+    all_seeds = selected_seeds
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         seed_iter = iter(all_seeds)
@@ -377,7 +368,7 @@ def collect_demonstrations(
 
             for future in done:
                 seed = futures.pop(future)
-                episode_state, episode_action, episode_betas, success, episode_length, returned_seed = future.result()
+                episode_state, episode_action, episode_goal_ids, success, episode_length, returned_seed = future.result()
 
                 if success and exists(episode_state):
                     if use_mission_embeddings: 
@@ -385,14 +376,14 @@ def collect_demonstrations(
                         buffer.store_episode(
                             state = episode_state[:episode_length],
                             action = episode_action[:episode_length],
-                            episode_betas = episode_betas[:episode_length],
+                            episode_goal_ids = episode_goal_ids[:episode_length],
                             mission_embedding = mission_embedding,
                         )
                     else:
                         buffer.store_episode(
                             state = episode_state[:episode_length],
                             action = episode_action[:episode_length],
-                            episode_betas = episode_betas[:episode_length],
+                            episode_goal_ids = episode_goal_ids[:episode_length],
                         )
                     
                     successful += 1
