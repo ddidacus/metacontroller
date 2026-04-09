@@ -56,7 +56,7 @@ def downsample_img(image, out_size=64):
 def make_env(env_id, **kwargs):
     if env_id == "NGoals":
         from environments.ngoals import NGoalsEnv
-        return NGoalsEnv(training_mode="train", **kwargs)
+        return NGoalsEnv(training_mode="train", ablate_tasks=False, **kwargs)
     else:
         return gym.make(env_id, **kwargs)
 

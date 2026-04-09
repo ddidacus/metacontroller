@@ -101,7 +101,6 @@ SUBTARGETS = [
 ]
 
 
-
 class NGoalsEnv(MiniGridEnv):
     def __init__(
         self,
@@ -111,12 +110,14 @@ class NGoalsEnv(MiniGridEnv):
         agent_start_pos=(1, 1),
         agent_start_dir=0,
         task_length=8,
+        ablate_tasks=False,
         max_steps: int | None = None,
         **kwargs,
     ):
         self.mode = training_mode
         self._seed = seed
         self._task_length = task_length
+        self._ablate_tasks = ablate_tasks
 
         self.agent_start_pos = agent_start_pos
         self.agent_start_dir = agent_start_dir
@@ -157,10 +158,13 @@ class NGoalsEnv(MiniGridEnv):
         return super().reset(seed=seed, options=options)
 
     def set_task_targets(self):
+        # intermediate tasks
+        if self._ablate_tasks: subtargets = SUBTARGETS[::2]
+        else: subtargets = SUBTARGETS
         # Select tasks depending on mode
         if self.mode == "train":
-            task_idx = random.randint(0, len(SUBTARGETS)-1)
-            self.task_targets = SUBTARGETS[task_idx]
+            task_idx = random.randint(0, len(subtargets)-1)
+            self.task_targets = subtargets[task_idx]
         elif self.mode == "eval":
             self.task_targets = TARGETS[:self._task_length]
         else: 
@@ -234,15 +238,12 @@ class NGoalsEnv(MiniGridEnv):
     def step(self, action):                                                                                  
         obs, reward, terminated, truncated, info = super().step(action)                                        
                                                                                                             
-        # The BabyAI bot navigates *next to* the target and faces it
-        # (GoNextToSubgoal pops when fwd_pos == target). Check the cell
-        # the agent is facing. This is safe on every step because BFS
-        # treats Goal objects as blockers and paths around them — the
-        # agent only ends up facing a goal after explicit navigation.
-        fwd_pos = self.agent_pos + self.dir_vec
-        fwd_cell = self.grid.get(*fwd_pos)
-        if fwd_cell is not None and fwd_cell.type == "goal":
-            color = fwd_cell.color
+        # Goal tiles are overlappable — the agent completes a goal by
+        # walking ON TOP of it. The BabyAI bot's BFS and GoNextToSubgoal
+        # have been patched to path through and land on Goal cells.
+        agent_cell = self.grid.get(*self.agent_pos)
+        if agent_cell is not None and agent_cell.type == "goal":
+            color = agent_cell.color
             if color == self.next_goal:
                 self.goals_achievement[color] = True
                 terminated = all(self.goals_achievement.values())
