@@ -2,7 +2,7 @@ from __future__ import annotations
 import random
 import imageio
 import numpy as np
-from itertools import permutations
+from itertools import product
 
 from environments.bot import BabyAIBotEpsilonGreedy
 from minigrid.core.constants import COLOR_NAMES
@@ -10,63 +10,11 @@ from minigrid.core.grid import Grid
 from minigrid.core.mission import MissionSpace
 from minigrid.core.world_object import Door, Goal, Key, Wall
 from minigrid.manual_control import ManualControl
+from minigrid.core.actions import Actions
 from minigrid.minigrid_env import MiniGridEnv
+from gymnasium.spaces import Discrete
 from minigrid.envs.babyai.core.verifier import GoToInstr, AndInstr, ObjDesc
 
-
-# 6 inner-wall layouts (agent always at (1,1)).
-# Each lambda(w, h) returns a list of (x, y) wall cells.
-# Goal positions are paired in _GOAL_POSITIONS — 4 (x,y) per layout, placed in the
-# distinct navigable regions formed by that layout's walls.
-_WALL_LAYOUTS = [
-    # 0: Cross — solid cross, no hole in the middle
-    lambda w, h: (
-        [(5, y) for y in range(2, h - 2)] +
-        [(x, 5) for x in range(2, w - 2) if x != 5]
-    ),
-    # 1: H-barriers — two vertical walls with gaps at mid-height (y=5)
-    lambda w, h: (
-        [(3, y) for y in range(2, 5)] + [(3, y) for y in range(6, h - 2)] +
-        [(7, y) for y in range(2, 5)] + [(7, y) for y in range(6, h - 2)]
-    ),
-    # 2: Staggered corridors — two horizontal walls with offset gaps (top gap right, bottom gap left)
-    lambda w, h: (
-        [(x, 3) for x in range(2, w - 2) if x != 7] +
-        [(x, 7) for x in range(2, w - 2) if x != 3]
-    ),
-    # 3: Z-shape — diagonal wall dividing the grid into two connected regions
-    lambda w, h: (
-        [(x, 3) for x in range(2, 6)] +
-        [(5, y) for y in range(3, 8)] +
-        [(x, 7) for x in range(5, w - 2)]
-    ),
-    # 4: L-shape — top wall with a descending left arm, entry gap at top-right
-    lambda w, h: (
-        [(x, 3) for x in range(2, w - 3)] +
-        [(2, y) for y in range(3, h - 2)]
-    ),
-    # 5: U-shape — mid horizontal wall with two upward arms, center gap
-    lambda w, h: (
-        [(x, 5) for x in range(2, 5)] + [(x, 5) for x in range(6, w - 2)] +
-        [(2, y) for y in range(2, 5)] +
-        [(w - 3, y) for y in range(2, 5)]
-    ),
-]
-
-_GOAL_POSITIONS = [
-    # 0: Cross — 8 goals spread across 4 quadrants (2 per quadrant)
-    [[2, 2], [4, 2], [7, 2], [8, 4], [2, 7], [4, 8], [7, 7], [8, 8]],
-    # 1: H-barriers — spread across 3 corridors (left, middle, right)
-    [[1, 2], [2, 8], [4, 2], [6, 8], [5, 5], [4, 5], [8, 2], [9, 8]],
-    # 2: Staggered corridors — spread across 3 horizontal bands
-    [[2, 1], [8, 2], [2, 5], [8, 5], [4, 4], [6, 6], [2, 9], [8, 8]],
-    # 3: Z-shape — spread across both regions
-    [[2, 1], [4, 2], [8, 2], [8, 5], [2, 5], [2, 8], [4, 9], [8, 9]],
-    # 4: L-shape — scattered in the accessible interior
-    [[4, 1], [8, 2], [5, 4], [8, 5], [5, 6], [8, 7], [5, 8], [8, 9]],
-    # 5: U-shape — 3 upper (between arms), 5 lower
-    [[4, 2], [6, 3], [5, 4], [1, 7], [4, 7], [7, 7], [3, 9], [8, 9]],
-]
 
 TARGETS = [
     "yellow",
@@ -90,15 +38,27 @@ TARGET_TO_ID = {
     "green": 8,
 }
 
-SUBTARGETS = [
-    ["yellow", "orange"],
-    ["orange", "red"],
-    ["red", "pink"],
-    ["pink", "purple"],
-    ["purple", "cyan"],
-    ["cyan", "blue"],
-    ["blue", "green"],
-]
+# All 56 ordered pairs of distinct colors (8 x 7)
+ALL_PAIRS = [(a, b) for a, b in product(TARGETS, TARGETS) if a != b]
+
+
+def generate_omitted_pairs(rng_seed=0):
+    """Generate 8 omitted pairs: for each color, one other color that never precedes it."""
+    rng = random.Random(rng_seed)
+    omitted = []
+    for color in TARGETS:
+        others = [c for c in TARGETS if c != color]
+        predecessor = rng.choice(others)
+        omitted.append((predecessor, color))
+    return omitted
+
+
+def _has_omitted_transition(sequence, omitted_pairs_set):
+    """Check if any consecutive pair in sequence is in the omitted set."""
+    for i in range(len(sequence) - 1):
+        if (sequence[i], sequence[i + 1]) in omitted_pairs_set:
+            return True
+    return False
 
 
 class NGoalsEnv(MiniGridEnv):
@@ -106,25 +66,20 @@ class NGoalsEnv(MiniGridEnv):
         self,
         seed=42,
         size=11,
-        training_mode="train",
-        agent_start_pos=(1, 1),
-        agent_start_dir=0,
-        task_length=8,
-        ablate_tasks=False,
+        num_pairs=3,
+        num_walls=12,
+        omitted_pairs=None,
         max_steps: int | None = None,
         **kwargs,
     ):
-        self.mode = training_mode
         self._seed = seed
-        self._task_length = task_length
-        self._ablate_tasks = ablate_tasks
+        self._num_pairs = num_pairs
+        self._num_walls = num_walls
+        self._omitted_pairs = omitted_pairs or []
+        self._omitted_set = set(tuple(p) for p in self._omitted_pairs)
 
-        self.agent_start_pos = agent_start_pos
-        self.agent_start_dir = agent_start_dir
-
-        self.goals_order = None
-        self.goals_achievement = {}
-        self.next_goal = None
+        self.task_targets = None
+        self.next_goal_idx = 0
 
         self.reset_seed()
         self.set_task_targets()
@@ -137,20 +92,20 @@ class NGoalsEnv(MiniGridEnv):
         super().__init__(
             mission_space=mission_space,
             grid_size=size,
-            # Set this to True for maximum speed
             see_through_walls=True,
+            highlight=False,
             max_steps=max_steps,
             **kwargs,
         )
+        self.action_space = Discrete(4)
 
     def get_next_goal_id(self):
-        return TARGET_TO_ID[self.next_goal]
+        return TARGET_TO_ID[self.task_targets[self.next_goal_idx]]
 
     def reset_seed(self):
         random.seed(self._seed)
 
     def reset(self, *, seed=None, options=None):
-        # Use the provided seed, or fall back to the constructor default
         if seed is not None:
             self._seed = seed
             self.reset_seed()
@@ -158,70 +113,49 @@ class NGoalsEnv(MiniGridEnv):
         return super().reset(seed=seed, options=options)
 
     def set_task_targets(self):
-        # intermediate tasks
-        if self._ablate_tasks: subtargets = SUBTARGETS[::2]
-        else: subtargets = SUBTARGETS
-        # Select tasks depending on mode
-        if self.mode == "train":
-            task_idx = random.randint(0, len(subtargets)-1)
-            self.task_targets = subtargets[task_idx]
-        elif self.mode == "eval":
-            self.task_targets = TARGETS[:self._task_length]
-        else: 
-            raise NotImplementedError()
+        """Pick 3 random pairs with all 6 colors distinct, avoiding omitted transitions."""
+        num_colors_needed = self._num_pairs * 2
+        while True:
+            colors = random.sample(TARGETS, num_colors_needed)
+            pairs = [(colors[2 * i], colors[2 * i + 1]) for i in range(self._num_pairs)]
+            random.shuffle(pairs)
+            sequence = [color for pair in pairs for color in pair]
+            if not _has_omitted_transition(sequence, self._omitted_set):
+                break
+        self.task_targets = sequence
 
     @staticmethod
     def _gen_mission(self):
-        ACTION = "move to: "
-        SEP = ", "
-        goals_permutations = list(permutations(self.task_targets))
-        rand_idx = random.randint(0, len(goals_permutations)-1)
-        mission = ACTION + SEP.join(self.task_targets)
-        
-        # Randomize order on the grid
-        self.goals_order = goals_permutations[rand_idx]
-
-        return mission
+        return "move to: " + ", ".join(self.task_targets)
 
     def _gen_grid(self, width, height):
-        # Regenerate goals_order from current task_targets
-        # (_gen_mission only runs during __init__, not on every reset)
-        goals_permutations = list(permutations(self.task_targets))
-        rand_idx = random.randint(0, len(goals_permutations) - 1)
-        self.goals_order = goals_permutations[rand_idx]
         self.mission = "move to: " + ", ".join(self.task_targets)
+        self.next_goal_idx = 0
 
-        # Create an empty grid
         self.grid = Grid(width, height)
-
-        # Generate the surrounding walls
         self.grid.wall_rect(0, 0, width, height)
 
-        # Pick layout: varies with seed (random state already seeded in __init__)
-        self.layout_idx = random.randint(0, len(_WALL_LAYOUTS) - 1)
-        for x, y in _WALL_LAYOUTS[self.layout_idx](width, height):
-            self.grid.set(x, y, Wall())
-
-        # Place the agent at a random free cell (not wall, not goal position)
-        goal_pos_set = set(tuple(p) for p in _GOAL_POSITIONS[self.layout_idx])
-        free_cells = [
+        inner_cells = [
             (x, y)
             for x in range(1, width - 1)
             for y in range(1, height - 1)
-            if self.grid.get(x, y) is None and (x, y) not in goal_pos_set
         ]
-        self.agent_pos = free_cells[random.randint(0, len(free_cells) - 1)]
-        self.agent_dir = random.randint(0, 3)
 
-        # Goals to achieve are FIXED, their position is randomized
-        self.goals_achievement = {c: False for c in self.task_targets}
-        self.next_goal = self.task_targets[0]
+        # 1) Place random interior walls
+        wall_positions = random.sample(inner_cells, self._num_walls)
+        for x, y in wall_positions:
+            self.grid.set(x, y, Wall())
 
-        # Place the goals in regions defined by the chosen layout
-        positions = _GOAL_POSITIONS[self.layout_idx]
+        free_cells = [c for c in inner_cells if c not in set(wall_positions)]
+
+        # 2) Place goal tiles for each unique color in the sequence
+        unique_colors = list(dict.fromkeys(self.task_targets))
+        goal_cells = random.sample(free_cells, len(unique_colors))
+        free_cells = [c for c in free_cells if c not in set(goal_cells)]
+
         goal_descs = {}
-        for idx, goal_color in enumerate(self.goals_order):
-            x, y = positions[idx]
+        for idx, goal_color in enumerate(unique_colors):
+            x, y = goal_cells[idx]
             obj = Goal(color=goal_color)
             self.put_obj(obj, x, y)
             desc = ObjDesc("goal", color=goal_color)
@@ -229,42 +163,41 @@ class NGoalsEnv(MiniGridEnv):
             desc.obj_poss = [(x, y)]
             goal_descs[goal_color] = desc
 
-        # Build instructions for the Bot with pre-populated ObjDescs
+        # 3) Place agent on a remaining free cell
+        agent_cell = free_cells[random.randint(0, len(free_cells) - 1)]
+        self.agent_pos = agent_cell
+        self.agent_dir = random.randint(0, 3)
+
+        # Build instructions for the Bot
         instrs = GoToInstr(goal_descs[self.task_targets[0]])
         for color in self.task_targets[1:]:
             instrs = AndInstr(instrs, GoToInstr(goal_descs[color]))
         self.instrs = instrs
 
-    def step(self, action):                                                                                  
-        obs, reward, terminated, truncated, info = super().step(action)                                        
-                                                                                                            
-        # Goal tiles are overlappable — the agent completes a goal by
-        # walking ON TOP of it. The BabyAI bot's BFS and GoNextToSubgoal
-        # have been patched to path through and land on Goal cells.
+    def step(self, action):
+        self.agent_dir = int(action)
+        obs, reward, terminated, truncated, info = super().step(Actions.forward)
+
         agent_cell = self.grid.get(*self.agent_pos)
         if agent_cell is not None and agent_cell.type == "goal":
             color = agent_cell.color
-            if color == self.next_goal:
-                self.goals_achievement[color] = True
-                terminated = all(self.goals_achievement.values())
-                if terminated:
+            current_target = self.task_targets[self.next_goal_idx]
+            if color == current_target:
+                self.next_goal_idx += 1
+                if self.next_goal_idx >= len(self.task_targets):
+                    terminated = True
                     reward = 1.0
                 else:
-                    # reward = 1.0 / float(len(self.goals_order))
+                    terminated = False
                     reward = 0.0
-                    self.next_goal = next(
-                        (c for c in self.task_targets if not self.goals_achievement[c]), None
-                    )
+            elif color in self.task_targets[:self.next_goal_idx]:
+                terminated = False
+                reward = 0.0
             else:
-                # Already visited: tolerate
-                if self.goals_achievement[color] == True:
-                    reward = 0.0
-                # Otherwise game over
-                else:
-                    terminated = True
-                    reward = -1.0
-                                                                                                            
-        return obs, reward, terminated, truncated, info  
+                terminated = True
+                reward = -1.0
+
+        return obs, reward, terminated, truncated, info
 
 
 def main():
