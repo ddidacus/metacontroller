@@ -101,6 +101,124 @@ def store_trajectory_gif(path:str, trajectory:torch.Tensor, upsample:int=8, fps:
         rgb_frames.append(np.array(img))
     imageio.mimsave(path, rgb_frames, fps=fps, loop=0)
 
+
+# RGB colors for each goal, keyed by TARGET_TO_ID values
+GOAL_COLORS_RGB = {
+    1: (255, 220, 0),    # yellow
+    2: (255, 140, 0),    # orange
+    3: (255, 50, 50),    # red
+    4: (255, 105, 180),  # pink
+    5: (160, 32, 240),   # purple
+    6: (0, 220, 220),    # cyan
+    7: (50, 100, 255),   # blue
+    8: (50, 205, 50),    # green
+}
+
+# Normalized [0,1] versions for matplotlib
+GOAL_COLORS_MPL = {k: (r/255, g/255, b/255) for k, (r, g, b) in GOAL_COLORS_RGB.items()}
+
+
+def store_trajectory_gif_with_beta(
+    path: str,
+    trajectory: torch.Tensor,
+    goal_ids: list[int],
+    upsample: int = 8,
+    fps: float = 20.0,
+    frame_skip: int = 1,
+):
+    """
+    Side-by-side GIF: game frame (left) + rolling switch-beta line plot (right).
+    The switch beta is a binary spike (1 at goal change, 0 otherwise).
+    The line color matches the current goal.
+    """
+    import imageio
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    T = len(goal_ids)
+    # Derive switch beta: 1 wherever the goal changes
+    switch_beta = [0] * T
+    for t in range(1, T):
+        if goal_ids[t] != goal_ids[t - 1]:
+            switch_beta[t] = 1
+
+    # Pre-compute game frames – ensure minimum 480px height
+    min_height = 480
+    sample_frame = trajectory[0].cpu().numpy()
+    raw_h, raw_w = sample_frame.shape[:2]
+    effective_upsample = max(upsample, int(np.ceil(min_height / raw_h)))
+
+    game_frames = []
+    for i, frame in enumerate(trajectory):
+        rgb_frame = symbolic_to_rgb(frame.cpu().numpy(), normalized=False)
+        h, w = rgb_frame.shape[:2]
+        img = Image.fromarray(rgb_frame, mode="RGB")
+        img = img.resize((w * effective_upsample, h * effective_upsample), Image.NEAREST)
+        game_frames.append(np.array(img))
+
+    game_h, game_w = game_frames[0].shape[:2]
+    plot_w, plot_h = game_w, game_h  # match dimensions
+
+    composite_frames = []
+    for t in range(T):
+        if t % frame_skip != 0:
+            continue
+
+        # --- matplotlib plot ---
+        plot_dpi = 150
+        fig, ax = plt.subplots(figsize=(plot_w / plot_dpi, plot_h / plot_dpi), dpi=plot_dpi)
+        fig.patch.set_facecolor("#191919")
+        ax.set_facecolor("#191919")
+
+        # Draw colored line segments up to current timestep
+        xs = list(range(t + 1))
+        for s in range(len(xs) - 1):
+            seg_color = GOAL_COLORS_MPL.get(goal_ids[s + 1], (1, 1, 1))
+            ax.plot(
+                [xs[s], xs[s + 1]],
+                [switch_beta[s], switch_beta[s + 1]],
+                color=seg_color,
+                linewidth=2,
+            )
+
+        # Mark switch-beta peaks
+        for s in range(t + 1):
+            if switch_beta[s] == 1:
+                peak_color = GOAL_COLORS_MPL.get(goal_ids[s], (1, 1, 1))
+                ax.plot(s, 1, "o", color=peak_color, markersize=6, zorder=5)
+
+        ax.set_xlim(0, T)
+        ax.set_ylim(-0.1, 1.3)
+        ax.set_yticks([0, 1])
+        ax.set_ylabel("switch β", color="white", fontsize=9)
+        ax.set_xlabel("timestep", color="white", fontsize=9)
+        ax.tick_params(colors="white", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#555555")
+
+        fig.tight_layout(pad=0.4)
+
+        # Rasterize to numpy array
+        fig.canvas.draw()
+        plot_img = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+        plt.close(fig)
+
+        # Resize plot to match game frame height
+        plot_pil = Image.fromarray(plot_img).resize((plot_w, game_h), Image.LANCZOS)
+        plot_arr = np.array(plot_pil)
+
+        # Composite side-by-side
+        composite = np.concatenate([game_frames[t], plot_arr], axis=1)
+        composite_frames.append(composite)
+
+    # Append 2 seconds of the final frame as a pause
+    num_pause_frames = int(fps * 2)
+    composite_frames.extend([composite_frames[-1]] * num_pause_frames)
+
+    imageio.mimsave(path, composite_frames, fps=fps, loop=0)
+
 def binary_betas_to_goal_index(betas:torch.Tensor):
         """
             Convert from binary betas (B, T) to dense goal index (B, T)
@@ -275,6 +393,11 @@ def main(
                             # record successful trajectory
                             print(f"Success, trajectory len: {episode_frames.shape[0]} ; reward: {reward}")
                             store_trajectory_gif(output_dir + f"/tl_{task_length}_success_{total_success}.gif", episode_frames)
+                            store_trajectory_gif_with_beta(
+                                output_dir + f"/tl_{task_length}_success_{total_success}_beta.gif",
+                                episode_frames,
+                                goal_ids=[g.item() for g in episode_goal_ids],
+                            )
                         # else:
                         #     print(f"Failure, trajectory len: {episode_frames.shape[0]} ; reward: {reward}")
                     break

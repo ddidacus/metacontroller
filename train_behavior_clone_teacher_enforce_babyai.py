@@ -28,7 +28,7 @@ import torch
 from torch.nn import init
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
@@ -53,6 +53,29 @@ import gymnasium as gym
 MODALITY_RESNET_RGB = "resnet_rgb"
 MODALITY_RAW_RGB = "raw_rgb"
 MODALITY_SYMBOLIC = "symbolic"
+
+
+def load_sharded_buffers(folder_prefix: str):
+    """
+    Load sharded ReplayBuffer folders (e.g. ngoals-1M-0, ngoals-1M-1, ...)
+    as read-only memmap buffers without merging into a single buffer.
+
+    Returns:
+        List of read-only ReplayBuffer instances.
+    """
+    import glob as glob_mod
+
+    shard_dirs = sorted(glob_mod.glob(f"{folder_prefix}-*"))
+    shard_dirs = [Path(d) for d in shard_dirs if Path(d).is_dir()]
+    assert len(shard_dirs) > 0, f"No shard folders found matching '{folder_prefix}-*'"
+
+    print(f"Found {len(shard_dirs)} shards: {[d.name for d in shard_dirs]}")
+
+    shard_buffers = [ReplayBuffer.from_folder(d) for d in shard_dirs]
+    total_episodes = sum(len(buf) for buf in shard_buffers)
+    print(f"Loaded {total_episodes} episodes across {len(shard_buffers)} shards (zero-copy memmap)")
+
+    return shard_buffers
 
 def is_new_suite_env(env_id):
     NEW_SUITE_ENVS = [
@@ -153,6 +176,7 @@ def visualize_switch_betas(
 def train(
     run_seed = 42,
     input_dir = None,
+    input_dir_prefix = None,
     env_id = None,
     resnet_pretraining_epochs = 0,
     modality = MODALITY_RAW_RGB,
@@ -210,6 +234,14 @@ def train(
 ):
 
     torch.manual_seed(run_seed)
+
+    # load sharded or single dataset
+    shard_buffers = None
+    if input_dir_prefix is not None:
+        assert input_dir is None, "Provide either input_dir or input_dir_prefix, not both"
+        shard_buffers = load_sharded_buffers(input_dir_prefix)
+
+    assert input_dir is not None or shard_buffers is not None, "Provide either input_dir or input_dir_prefix"
 
     def store_checkpoint(step:int = None, is_discovering: bool = False):
         if accelerator.is_main_process:
@@ -295,11 +327,26 @@ def train(
 
     # replay buffer and dataloader
 
-    input_path = Path(input_dir)
-    assert input_path.exists(), f"Input directory {input_dir} does not exist"
+    if shard_buffers is not None:
+        from functools import partial
+        from memmap_replay_buffer.replay_buffer import collate_var_time
 
-    replay_buffer = ReplayBuffer.from_folder(input_path)
-    dataloader = replay_buffer.dataloader(batch_size = batch_size)
+        # build a ConcatDataset over all shards (zero-copy memmap reads)
+        datasets = [buf.dataset() for buf in shard_buffers]
+        concat_dataset = ConcatDataset(datasets)
+
+        fields_to_pad = shard_buffers[0].fieldnames
+        collate_fn = partial(collate_var_time, fields_to_pad=fields_to_pad)
+        dataloader = DataLoader(concat_dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
+
+        # use first shard for shape info
+        replay_buffer = shard_buffers[0]
+    else:
+        input_path = Path(input_dir)
+        assert input_path.exists(), f"Input directory {input_dir} does not exist"
+
+        replay_buffer = ReplayBuffer.from_folder(input_path)
+        dataloader = replay_buffer.dataloader(batch_size = batch_size)
 
     # state shape and action dimension
     # state: (B, T, H, W, C) or (B, T, D)
@@ -339,9 +386,9 @@ def train(
         dim = dim,
         state_embed_readout = dict(
             num_continuous = state_dim,
-            readout_kwargs = dict(continuous_log_var_embed = False)
+            readout_kwargs = dict(continuous_log_var_embed = True) # NLL Loss, sampled from multivariate gaussian
         ),
-        action_embed_readout = dict(num_discrete = num_actions),
+        action_embed_readout = dict(num_discrete = num_actions), # CE Loss
         lower_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
         upper_body = dict(depth = depth, heads = heads, attn_dim_head = dim_head),
         meta_controller = meta_controller,
@@ -530,8 +577,8 @@ def train(
 
         for batch in progress_bar:
 
-            goal_signals = batch['episode_goal_ids'] # B, T
-            
+            goal_signals = batch['episode_goal_ids'].long() # B, T
+
             # rgb -> norm and multichannel, ready for resnet
             if modality == MODALITY_RESNET_RGB:
                 states = batch['state'].float()
@@ -545,7 +592,7 @@ def train(
                 states = torch.clamp(states / 255.0, min=0.0, max=1.0)
                 states = (states - torch.tensor([0.485, 0.456, 0.406]).to(states.device)) / torch.tensor([0.229, 0.224, 0.225]).to(states.device)
                 states = rearrange(states, 'b t ... -> b t (...)')
-            
+
             # symbolic -> just flatten
 
             elif modality == MODALITY_SYMBOLIC:

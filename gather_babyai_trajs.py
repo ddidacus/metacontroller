@@ -40,7 +40,8 @@ from minigrid.core.constants import OBJECT_TO_IDX
 
 from memmap_replay_buffer import ReplayBuffer
 
-# Difficulty thresholds based on mission length
+# difficulty thresholds based on mission length
+
 EASY_MAX_LENGTH = 30      # easy: 0 to 30
 MEDIUM_MAX_LENGTH = 75    # medium: 30 to 75, hard: > 75
 MIN_ACCEPTABLE_LENGTH = 20
@@ -56,7 +57,7 @@ def downsample_img(image, out_size=64):
 def make_env(env_id, **kwargs):
     if env_id == "NGoals":
         from environments.ngoals import NGoalsEnv
-        return NGoalsEnv(training_mode="train", ablate_tasks=False, **kwargs)
+        return NGoalsEnv(**kwargs)
     else:
         return gym.make(env_id, **kwargs)
 
@@ -243,6 +244,16 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
     #     env.close()
     #     return None, None, False, 0, seed
 
+def collect_episode_batch(env_id, seeds, num_steps, random_action_prob, state_shape, num_actions=None, use_rgb_states=False, use_difficulty=False):
+    """
+    Collect episodes for a batch of seeds in a single worker call.
+    Returns a list of (episode_state, episode_action, episode_goal_ids, success, episode_length, seed) tuples.
+    """
+    results = []
+    for seed in seeds:
+        results.append(collect_single_episode(env_id, seed, num_steps, random_action_prob, state_shape, num_actions, use_rgb_states, use_difficulty))
+    return results
+
 def collect_demonstrations(
     use_rgb_states = False,
     env_id = "BabyAI-MiniBossLevel-v0",
@@ -327,8 +338,8 @@ def collect_demonstrations(
     output_folder = Path(output_dir)
 
     fields = {
-        'state': ('float', state_shape),
-        'action': ('float', ()),
+        'state': ('uint8', state_shape),
+        'action': ('uint8', ()),
         'episode_goal_ids': ('uint8', ()),
     }
 
@@ -345,56 +356,60 @@ def collect_demonstrations(
         overwrite = True,
     )
 
-    max_pending = num_workers
+    batch_size = 64
+    max_pending = num_workers * 2
     all_seeds = selected_seeds
+    use_difficulty_flag = (difficulty != None)
+
+    # chunk seeds into batches
+    seed_batches = [all_seeds[i:i + batch_size] for i in range(0, len(all_seeds), batch_size)]
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        seed_iter = iter(all_seeds)
+        batch_iter = iter(seed_batches)
         futures = {}
 
-        # submit
+        # submit initial batches
+        for _ in range(min(max_pending, len(seed_batches))):
+            batch = next(batch_iter, None)
+            if exists(batch):
+                future = executor.submit(collect_episode_batch, env_id, batch, num_steps, random_action_prob, state_shape, num_actions, use_rgb_states, use_difficulty_flag)
+                futures[future] = batch
 
-        for _ in range(min(max_pending, len(all_seeds))):
-            seed = next(seed_iter, None)
-            if exists(seed):
-                use_difficulty = (difficulty != None)
-                future = executor.submit(collect_single_episode, env_id, seed, num_steps, random_action_prob, state_shape, num_actions, use_rgb_states, use_difficulty)
-                futures[future] = seed
-
-        # collect
-
+        # collect results
         while futures:
             done, _ = wait(futures, return_when=FIRST_COMPLETED)
 
             for future in done:
-                seed = futures.pop(future)
-                episode_state, episode_action, episode_goal_ids, success, episode_length, returned_seed = future.result()
+                batch = futures.pop(future)
+                results = future.result()
 
-                if success and exists(episode_state):
-                    if use_mission_embeddings: 
-                        mission_embedding = seed_to_embedding[returned_seed]
-                        buffer.store_episode(
-                            state = episode_state[:episode_length],
-                            action = episode_action[:episode_length],
-                            episode_goal_ids = episode_goal_ids[:episode_length],
-                            mission_embedding = mission_embedding,
-                        )
-                    else:
-                        buffer.store_episode(
-                            state = episode_state[:episode_length],
-                            action = episode_action[:episode_length],
-                            episode_goal_ids = episode_goal_ids[:episode_length],
-                        )
-                    
-                    successful += 1
+                for episode_state, episode_action, episode_goal_ids, success, episode_length, returned_seed in results:
+                    if success and exists(episode_state):
+                        if use_mission_embeddings:
+                            mission_embedding = seed_to_embedding[returned_seed]
+                            buffer.store_episode(
+                                state = episode_state[:episode_length],
+                                action = episode_action[:episode_length],
+                                episode_goal_ids = episode_goal_ids[:episode_length],
+                                mission_embedding = mission_embedding,
+                            )
+                        else:
+                            buffer.store_episode(
+                                state = episode_state[:episode_length],
+                                action = episode_action[:episode_length],
+                                episode_goal_ids = episode_goal_ids[:episode_length],
+                            )
 
-                progressbar.update(1)
-                progressbar.set_description(f"success rate = {successful}/{progressbar.n:.2f}")
+                        successful += 1
 
-                seed = next(seed_iter, None)
-                if exists(seed):
-                    new_future = executor.submit(collect_single_episode, env_id, seed, num_steps, random_action_prob, state_shape, num_actions, use_rgb_states)
-                    futures[new_future] = seed
+                    progressbar.update(1)
+                    progressbar.set_description(f"success rate = {successful}/{progressbar.n:.2f}")
+
+                # submit next batch
+                batch = next(batch_iter, None)
+                if exists(batch):
+                    new_future = executor.submit(collect_episode_batch, env_id, batch, num_steps, random_action_prob, state_shape, num_actions, use_rgb_states, use_difficulty_flag)
+                    futures[new_future] = batch
 
     buffer.flush()
     progressbar.close()
