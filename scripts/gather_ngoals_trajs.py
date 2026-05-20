@@ -53,6 +53,22 @@ def sample(prob):
 
 # functions
 
+def get_bot_cardinal_action(bot, env, last_action):
+    from minigrid.core.actions import Actions
+    for _ in range(10):
+        try:
+            action = bot.replan(last_action)
+        except Exception:
+            return None, last_action
+        if action == Actions.left:
+            env.unwrapped.agent_dir = (env.unwrapped.agent_dir - 1) % 4
+        elif action == Actions.right:
+            env.unwrapped.agent_dir = (env.unwrapped.agent_dir + 1) % 4
+        elif action == Actions.forward:
+            return env.unwrapped.agent_dir + 1, action
+        last_action = action
+    return None, last_action
+
 def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_shape, use_rgb_states=False, env_kwargs=None):
     from minigrid.core.actions import Actions
 
@@ -65,6 +81,7 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
     else:
         env = SymbolicObsWrapper(env)
 
+    num_actions = env.unwrapped.action_space.n
     state_obs, _ = env.reset(seed=seed)
     episode_state = np.zeros((num_steps, *state_shape), dtype=np.uint8)
     episode_action = np.zeros(num_steps, dtype=np.uint8)
@@ -73,56 +90,28 @@ def collect_single_episode(env_id, seed, num_steps, random_action_prob, state_sh
     bot = BabyAIBot(env.unwrapped)
     last_action = None
     cumulative_reward = 0
-    step_idx = 0
 
-    max_bot_actions = num_steps * 4
-    for _ in range(max_bot_actions):
-        if step_idx >= num_steps:
-            break
-
-        try:
-            action = bot.replan(last_action)
-        except Exception:
-            env.close()
-            return None, None, None, False, 0, seed
-
+    for step_idx in range(num_steps):
         if random_action_prob > 0 and sample(random_action_prob):
-            action = random.randint(0, 3)
-            # Treat random action as cardinal move
-            episode_state[step_idx] = state_obs["image"].copy()
-            episode_action[step_idx] = action
-            episode_goal_ids[step_idx] = env.unwrapped.get_next_goal_id()
-            state_obs, reward, terminated, truncated, info = env.step(action)
-            cumulative_reward += reward
+            cardinal = random.randint(1, num_actions)
             last_action = Actions.forward
-            step_idx += 1
-            if terminated:
-                env.close()
-                if cumulative_reward <= 0.0:
-                    return None, None, None, False, 0, seed
-                return episode_state, episode_action, episode_goal_ids, True, step_idx, seed
-        elif action == Actions.left:
-            env.unwrapped.agent_dir = (env.unwrapped.agent_dir - 1) % 4
-            last_action = action
-        elif action == Actions.right:
-            env.unwrapped.agent_dir = (env.unwrapped.agent_dir + 1) % 4
-            last_action = action
-        elif action == Actions.forward:
-            cardinal = env.unwrapped.agent_dir
-            episode_state[step_idx] = state_obs["image"].copy()
-            episode_action[step_idx] = cardinal
-            episode_goal_ids[step_idx] = env.unwrapped.get_next_goal_id()
-            state_obs, reward, terminated, truncated, info = env.step(cardinal)
-            cumulative_reward += reward
-            last_action = action
-            step_idx += 1
-            if terminated:
-                env.close()
-                if cumulative_reward <= 0.0:
-                    return None, None, None, False, 0, seed
-                return episode_state, episode_action, episode_goal_ids, True, step_idx, seed
         else:
-            last_action = action
+            cardinal, last_action = get_bot_cardinal_action(bot, env, last_action)
+            if cardinal is None:
+                env.close()
+                return None, None, None, False, 0, seed
+
+        episode_state[step_idx] = state_obs["image"].copy()
+        episode_action[step_idx] = cardinal
+        episode_goal_ids[step_idx] = env.unwrapped.get_next_goal_id()
+        state_obs, reward, terminated, truncated, info = env.step(cardinal)
+        cumulative_reward += reward
+
+        if terminated:
+            env.close()
+            if cumulative_reward <= 0.0:
+                return None, None, None, False, 0, seed
+            return episode_state, episode_action, episode_goal_ids, True, step_idx + 1, seed
 
     env.close()
     return episode_state, episode_action, episode_goal_ids, False, num_steps, seed
@@ -149,7 +138,7 @@ def collect_demonstrations(
     from environments.ngoals import generate_omitted_pairs
 
     omitted_pairs = generate_omitted_pairs(rng_seed=0)
-    env_kwargs = dict(num_pairs=num_pairs, num_walls=num_walls, size=grid_size, max_steps=num_steps, omitted_pairs=omitted_pairs)
+    env_kwargs = dict(num_pairs=num_pairs, num_walls=num_walls, size=grid_size, max_steps=num_steps, omitted_pairs=omitted_pairs, mode="train")
 
     if env_id not in gym.envs.registry:
         minigrid.register_minigrid_envs()

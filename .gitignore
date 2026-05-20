@@ -12,6 +12,8 @@ notebooks/
 *.pt
 ngoals*/
 results/
+*.txt
+seeds_tmp*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

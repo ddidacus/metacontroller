@@ -25,9 +25,16 @@ class EnforcedMetaController(nn.Module):
         assert self.embed_dim is not None, "must provide embed_dim or dim"
 
         # one linear probe per goal (indexed 1..num_goals in goal_signals)
+        inner_dim = int(self.embed_dim//2)
+        # self.U_t = nn.ModuleList([
+        #     nn.Sequential(
+        #         nn.Linear(self.embed_dim, inner_dim, bias=True),
+        #         nn.Linear(inner_dim, inner_dim, bias=True),
+        #         nn.Linear(inner_dim, self.embed_dim, bias=True),
+        #     ) for _ in range(num_goals)
+        # ])
         self.U_t = nn.ModuleList([
-            nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-            for _ in range(num_goals)
+            nn.Linear(self.embed_dim, self.embed_dim, bias=True) for _ in range(num_goals)
         ])
 
         self.register_buffer('zero', tensor(0.), persistent=False)

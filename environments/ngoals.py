@@ -2,7 +2,10 @@ from __future__ import annotations
 import random
 import imageio
 import numpy as np
+from pathlib import Path
 from itertools import product
+
+import yaml
 
 from environments.bot import BabyAIBotEpsilonGreedy
 from minigrid.core.constants import COLOR_NAMES
@@ -42,42 +45,35 @@ TARGET_TO_ID = {
 ALL_PAIRS = [(a, b) for a, b in product(TARGETS, TARGETS) if a != b]
 
 
-def generate_omitted_pairs(rng_seed=0):
-    """Generate 8 omitted pairs: for each color, one other color that never precedes it."""
-    rng = random.Random(rng_seed)
-    omitted = []
-    for color in TARGETS:
-        others = [c for c in TARGETS if c != color]
-        predecessor = rng.choice(others)
-        omitted.append((predecessor, color))
-    return omitted
-
-
-def _has_omitted_transition(sequence, omitted_pairs_set):
-    """Check if any consecutive pair in sequence is in the omitted set."""
-    for i in range(len(sequence) - 1):
-        if (sequence[i], sequence[i + 1]) in omitted_pairs_set:
-            return True
-    return False
+def load_env_config(config_path: str | Path) -> dict:
+    with open(config_path) as f:
+        return yaml.safe_load(f)
 
 
 class NGoalsEnv(MiniGridEnv):
     def __init__(
         self,
-        seed=42,
-        size=11,
-        num_pairs=3,
-        num_walls=12,
-        omitted_pairs=None,
+        seed: int,
+        config: str | Path,
+        size: int = None,
+        num_walls: int = 0,
         max_steps: int | None = None,
+        mode: str = "train",
         **kwargs,
     ):
-        self._seed = seed
-        self._num_pairs = num_pairs
-        self._num_walls = num_walls
-        self._omitted_pairs = omitted_pairs or []
-        self._omitted_set = set(tuple(p) for p in self._omitted_pairs)
+        assert mode in ("train", "test"), f"mode must be 'train' or 'test', got '{mode}'"
 
+        cfg = load_env_config(config)
+        self._train_sequences = cfg["train_tasks"]
+        self._test_sequences = cfg["test_tasks"]
+        if size is None:
+            size = cfg.get("grid_size", 8)
+        if max_steps is None:
+            max_steps = cfg.get("trajectory_length")
+
+        self._seed = seed
+        self._num_walls = num_walls
+        self._mode = mode
         self.task_targets = None
         self.next_goal_idx = 0
 
@@ -97,7 +93,7 @@ class NGoalsEnv(MiniGridEnv):
             max_steps=max_steps,
             **kwargs,
         )
-        self.action_space = Discrete(4)
+        self.action_space = Discrete(4, start=1)
 
     def get_next_goal_id(self):
         return TARGET_TO_ID[self.task_targets[self.next_goal_idx]]
@@ -113,16 +109,11 @@ class NGoalsEnv(MiniGridEnv):
         return super().reset(seed=seed, options=options)
 
     def set_task_targets(self):
-        """Pick 3 random pairs with all 6 colors distinct, avoiding omitted transitions."""
-        num_colors_needed = self._num_pairs * 2
-        while True:
-            colors = random.sample(TARGETS, num_colors_needed)
-            pairs = [(colors[2 * i], colors[2 * i + 1]) for i in range(self._num_pairs)]
-            random.shuffle(pairs)
-            sequence = [color for pair in pairs for color in pair]
-            if not _has_omitted_transition(sequence, self._omitted_set):
-                break
-        self.task_targets = sequence
+        if self._mode == "test":
+            seq = random.choice(self._test_sequences)
+        else:
+            seq = random.choice(self._train_sequences)
+        self.task_targets = [TARGETS[i] for i in seq]
 
     @staticmethod
     def _gen_mission(self):
@@ -175,7 +166,7 @@ class NGoalsEnv(MiniGridEnv):
         self.instrs = instrs
 
     def step(self, action):
-        self.agent_dir = int(action)
+        self.agent_dir = int(action) - 1
         obs, reward, terminated, truncated, info = super().step(Actions.forward)
 
         agent_cell = self.grid.get(*self.agent_pos)
@@ -194,7 +185,7 @@ class NGoalsEnv(MiniGridEnv):
                 terminated = False
                 reward = 0.0
             else:
-                terminated = True
+                terminated = False
                 reward = -1.0
 
         return obs, reward, terminated, truncated, info
