@@ -10,6 +10,34 @@ Implementation of the MetaController proposed in [Emergent temporal abstractions
 $ pip install metacontroller-pytorch
 ```
 
+## Reproducing experiments
+
+#### Causal Model Intervention
+```
+NUM_TRAJECTORIES=10_000_000
+NUM_WORKERS=24
+SEED=42
+EXPERIMENT_DIR=experiments/
+
+python scripts/train_causal_model_intervention.py \
+    --run_seed "$SEED" \
+    --num_trajectories "$NUM_TRAJECTORIES" \
+    --num_workers "$NUM_WORKERS" \
+    --env_config "configs/environment/metacontroller_simplified.yml" \
+    --modality "symbolic" \
+    --lr_schedule "constant" \
+    --batch_size 1024 \
+    --lr 3e-4 \
+    --discovery_lr 3e-4 \
+    --state_loss_weight 1e-3 \
+    --action_loss_weight 1 \
+    --discovery_obs_loss_weight 1e-3 \
+    --discovery_action_recon_loss_weight 1 \
+    --eval_steps 100 \
+    --use_wandb \
+    --checkpoint_dir "${EXPERIMENT_DIR}"
+```
+
 ## Appreciation
 
 - [Pranoy](https://github.com/pranoyr) for submitting a pull request for fixing the previous latent action not being included in the inputs to the switching unit

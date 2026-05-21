@@ -16,6 +16,7 @@ from minigrid.manual_control import ManualControl
 from minigrid.core.actions import Actions
 from minigrid.minigrid_env import MiniGridEnv
 from gymnasium.spaces import Discrete
+
 from minigrid.envs.babyai.core.verifier import GoToInstr, AndInstr, ObjDesc
 
 
@@ -76,8 +77,8 @@ class NGoalsEnv(MiniGridEnv):
         self._mode = mode
         self.task_targets = None
         self.next_goal_idx = 0
+        self._rng = random.Random(seed)
 
-        self.reset_seed()
         self.set_task_targets()
 
         mission_space = MissionSpace(mission_func=self._gen_mission, ordered_placeholders=[[self]])
@@ -93,26 +94,22 @@ class NGoalsEnv(MiniGridEnv):
             max_steps=max_steps,
             **kwargs,
         )
-        self.action_space = Discrete(4, start=1)
+        self.action_space = Discrete(4)
 
     def get_next_goal_id(self):
         return TARGET_TO_ID[self.task_targets[self.next_goal_idx]]
 
-    def reset_seed(self):
-        random.seed(self._seed)
-
     def reset(self, *, seed=None, options=None):
         if seed is not None:
-            self._seed = seed
-            self.reset_seed()
+            self._rng = random.Random(seed)
         self.set_task_targets()
         return super().reset(seed=seed, options=options)
 
     def set_task_targets(self):
         if self._mode == "test":
-            seq = random.choice(self._test_sequences)
+            seq = self._rng.choice(self._test_sequences)
         else:
-            seq = random.choice(self._train_sequences)
+            seq = self._rng.choice(self._train_sequences)
         self.task_targets = [TARGETS[i] for i in seq]
 
     @staticmethod
@@ -133,7 +130,7 @@ class NGoalsEnv(MiniGridEnv):
         ]
 
         # 1) Place random interior walls
-        wall_positions = random.sample(inner_cells, self._num_walls)
+        wall_positions = self._rng.sample(inner_cells, self._num_walls)
         for x, y in wall_positions:
             self.grid.set(x, y, Wall())
 
@@ -141,7 +138,7 @@ class NGoalsEnv(MiniGridEnv):
 
         # 2) Place goal tiles for each unique color in the sequence
         unique_colors = list(dict.fromkeys(self.task_targets))
-        goal_cells = random.sample(free_cells, len(unique_colors))
+        goal_cells = self._rng.sample(free_cells, len(unique_colors))
         free_cells = [c for c in free_cells if c not in set(goal_cells)]
 
         goal_descs = {}
@@ -155,9 +152,9 @@ class NGoalsEnv(MiniGridEnv):
             goal_descs[goal_color] = desc
 
         # 3) Place agent on a remaining free cell
-        agent_cell = free_cells[random.randint(0, len(free_cells) - 1)]
+        agent_cell = free_cells[self._rng.randint(0, len(free_cells) - 1)]
         self.agent_pos = agent_cell
-        self.agent_dir = random.randint(0, 3)
+        self.agent_dir = self._rng.randint(0, 3)
 
         # Build instructions for the Bot
         instrs = GoToInstr(goal_descs[self.task_targets[0]])
@@ -166,7 +163,7 @@ class NGoalsEnv(MiniGridEnv):
         self.instrs = instrs
 
     def step(self, action):
-        self.agent_dir = int(action) - 1
+        self.agent_dir = int(action)
         obs, reward, terminated, truncated, info = super().step(Actions.forward)
 
         agent_cell = self.grid.get(*self.agent_pos)

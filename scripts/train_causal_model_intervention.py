@@ -54,9 +54,10 @@ MODALITY_RAW_RGB = "raw_rgb"
 MODALITY_SYMBOLIC = "symbolic"
 
 
-# --- on-the-fly trajectory collection (adapted from scripts/gather_ngoals_trajs.py) ---
+# collect online samples with the BabyAI bot
 
-def _get_bot_cardinal_action(bot, env, last_action):
+def _resolve_bot_cardinal(bot, env, last_action):
+    """Collapse the bot's turn sequence into a single cardinal direction (0-3)."""
     from minigrid.core.actions import Actions
     for _ in range(10):
         try:
@@ -68,7 +69,7 @@ def _get_bot_cardinal_action(bot, env, last_action):
         elif action == Actions.right:
             env.unwrapped.agent_dir = (env.unwrapped.agent_dir + 1) % 4
         elif action == Actions.forward:
-            return env.unwrapped.agent_dir + 1, action
+            return env.unwrapped.agent_dir, action
         last_action = action
     return None, last_action
 
@@ -87,12 +88,12 @@ def collect_trajectory(env, seed, num_steps, state_shape):
     cumulative_reward = 0
 
     for step_idx in range(num_steps):
-        cardinal, last_action = _get_bot_cardinal_action(bot, env, last_action)
+        cardinal, last_action = _resolve_bot_cardinal(bot, env, last_action)
         if cardinal is None:
             return None
 
         episode_state[step_idx] = state_obs["image"]
-        episode_action[step_idx] = cardinal
+        episode_action[step_idx] = cardinal + 1
         episode_goal_ids[step_idx] = env.unwrapped.get_next_goal_id()
         state_obs, reward, terminated, truncated, _ = env.step(cardinal)
         cumulative_reward += reward
@@ -116,7 +117,7 @@ def _collect_one_successful(env_config, env_mode, num_steps, state_shape, max_se
     from minigrid.wrappers import SymbolicObsWrapper
     from environments.ngoals import NGoalsEnv
 
-    env_inner = NGoalsEnv(seed=1, config=env_config, mode=env_mode)
+    env_inner = NGoalsEnv(seed=random.randint(1, max_seed), config=env_config, mode=env_mode)
     env = SymbolicObsWrapper(env_inner)
 
     while True:
@@ -161,7 +162,7 @@ def collect_batch(env_config, env_mode, batch_size, num_steps, state_shape, max_
     }
 
 
-# --- helpers ---
+# network helpers
 
 def set_requires_grad(network: nn.Module, grad_val: bool):
     for param in network.parameters():
@@ -182,6 +183,10 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+
+# evaluation helpers
+
 
 def visualize_switch_betas(
     switch_betas,      # (B, T-1)
@@ -226,13 +231,12 @@ def visualize_switch_betas(
 
     plt.close(fig)
 
-
 def _sample_solvable_eval_seeds(env_config, num_seeds, traj_length, state_shape, max_seed):
     """Sample random seeds that are solvable by the bot (test mode)."""
     from minigrid.wrappers import SymbolicObsWrapper
     from environments.ngoals import NGoalsEnv
 
-    env_inner = NGoalsEnv(seed=1, config=env_config, mode="test")
+    env_inner = NGoalsEnv(seed=random.randint(1, max_seed), config=env_config, mode="test")
     env = SymbolicObsWrapper(env_inner)
 
     seeds = []
@@ -309,7 +313,7 @@ def evaluate_ngoals_success_rate(
             action = unwrapped_model.action_readout.sample(logits)
             past_action_id = action
 
-            action_id = action.item()
+            action_id = action.item() - 1
             next_state, reward, terminated, truncated, _ = env.step(action_id)
 
             if terminated or truncated:
@@ -349,6 +353,8 @@ def evaluate_ngoals_success_rate(
 
     return success_rate
 
+
+# training
 
 def train(
     run_seed = 42,
@@ -718,8 +724,9 @@ def train(
 
         optim = optim_model if not is_discovering else optim_meta_controller
 
-        # collect batch on-the-fly
-        batch = collect_batch(env_config, "train", batch_size, traj_length, state_shape, max_seed=num_trajectories, num_workers=num_workers)
+        # collect batch on-the-fly (each GPU collects its shard)
+        local_batch_size = batch_size // accelerator.num_processes
+        batch = collect_batch(env_config, "train", local_batch_size, traj_length, state_shape, max_seed=num_trajectories, num_workers=num_workers)
         batch = {k: v.to(device) for k, v in batch.items()}
 
         goal_signals = batch['episode_goal_ids'].long()
